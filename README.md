@@ -67,8 +67,28 @@ transfer problem. It does not contain console keys or account information.
 
 ## Building
 
-Install the devkitPro Switch toolchain, the Switch SDL2 and SDL2_ttf portlibs,
-and [ounce-devkit](https://github.com/ouncebrew/ounce-devkit). Then run:
+Start by installing
+[devkitPro pacman](https://devkitpro.org/wiki/devkitPro_pacman). KaiDump needs
+the following devkitPro packages:
+
+- [`switch-dev`](https://devkitpro.org/wiki/Getting_Started) — the compiler,
+  Switch tools, and standard libraries
+- [`switch-sdl2`](https://github.com/devkitPro/pacman-packages/tree/master/switch/SDL2)
+- [`switch-sdl2_ttf`](https://github.com/devkitPro/pacman-packages/tree/master/switch/SDL2_ttf)
+
+They can be installed with:
+
+```sh
+sudo dkp-pacman -S switch-dev switch-sdl2 switch-sdl2_ttf
+```
+
+On systems where devkitPro uses the system `pacman`, use `pacman` in place of
+`dkp-pacman`.
+
+Next, install
+[ounce-devkit](https://github.com/ouncebrew/ounce-devkit#install). Its installer
+adds libounce, libkaihen, and the Switch 2 build files to the devkitPro setup.
+Once everything is installed, build KaiDump with:
 
 ```sh
 export DEVKITPRO=/opt/devkitpro
