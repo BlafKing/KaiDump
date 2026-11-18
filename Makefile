@@ -37,7 +37,7 @@ OBJECTS     := $(SOURCES:%.c=$(BUILD)/%.o)
 
 APP_TITLE   := KaiDump
 APP_AUTHOR  := TomDom
-APP_VERSION := 0.15.0
+APP_VERSION := 1.0.0
 
 all: $(TARGET).nro
 
@@ -51,7 +51,7 @@ $(BUILD)/%.o: source/%.c | $(BUILD)
 $(BUILD)/$(TARGET).elf: $(OBJECTS)
 	$(PREFIX)gcc $(LDFLAGS) $^ $(LIBS) -o $@
 
-$(BUILD)/$(TARGET).nacp: | $(BUILD)
+$(BUILD)/$(TARGET).nacp: Makefile | $(BUILD)
 	$(DEVKITPRO)/tools/bin/nacptool --create \
 		"$(APP_TITLE)" "$(APP_AUTHOR)" "$(APP_VERSION)" $@
 
