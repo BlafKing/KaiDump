@@ -1,0 +1,816 @@
+#include "app_internal.h"
+
+/* Archive preparation and SD, FTP, or USB export orchestration. */
+
+/* Virtual archive sources ------------------------------------------------ */
+
+typedef struct {
+    bool exefs_active;
+    bool exefs_fsldr_active;
+    bool romfs_active;
+    bool romfs_device;
+    bool romfs_combined_name;
+} NupMountContext;
+
+static void unmount_nup_source(void *user) {
+    NupMountContext *context = user;
+    if (context->exefs_active) {
+        fsdevUnmountDevice("kdnexe");
+        context->exefs_active = false;
+    }
+    if (context->exefs_fsldr_active) {
+        fsldrExit();
+        context->exefs_fsldr_active = false;
+        log_line("nup-exefs-fsldr-session-released");
+    }
+    if (context->romfs_active) {
+        const char *name = context->romfs_combined_name ? "kdrom" : "kdnrom";
+        unmount_title_romfs(name, context->romfs_device);
+        context->romfs_active = false;
+        context->romfs_combined_name = false;
+    }
+}
+
+static Result mount_nup_exefs_status(
+    const NsApplicationContentMetaStatus *status,
+    const NsApplicationContentMetaStatus *original_status,
+    u64 program_id, NupMountContext *context) {
+    FsFileSystem filesystem = {0};
+    Result result = open_title_exefs(
+        &filesystem, program_id, status, original_status);
+    if (R_SUCCEEDED(result)) {
+        int device = fsdevMountDevice("kdnexe", filesystem);
+        log_line("nup-exefs-mount device=%d", device);
+        if (device >= 0) {
+            context->exefs_active = true;
+            context->exefs_fsldr_active = true;
+            return 0;
+        }
+        fsldrExit();
+        log_line("nup-exefs-fsldr-session-released-after-mount-failure");
+        result = MAKERESULT(Module_Libnx, LibnxError_TooManyDevOpTabs);
+    }
+    return result;
+}
+
+static Result mount_nup_combined_exefs(
+    const ContentChoice *choice, NupMountContext *context) {
+    Application *app = &g.applications[g.selected];
+    s32 index = choice->update_index >= 0
+        ? choice->update_index : choice->meta_index;
+    const NsApplicationContentMetaStatus *original =
+        index != choice->meta_index ? &g.meta[choice->meta_index] : NULL;
+    return mount_nup_exefs_status(
+        &g.meta[index], original, app->record.application_id, context);
+}
+
+static Result mount_nup_romfs_status(
+    const NsApplicationContentMetaStatus *status, NupMountContext *context) {
+    bool addon = status->meta_type == NcmContentMetaType_AddOnContent ||
+                 status->meta_type == NcmContentMetaType_DataPatch;
+    u8 content_type = addon ? NcmContentType_Data : NcmContentType_Program;
+    u32 proxy_type = addon ? FsFileSystemType_ContentData : 1;
+    char path[FS_MAX_PATH] = {0};
+    FsContentAttributes attributes = 0;
+    Result result = resolve_installed_content(
+        status, content_type, path, sizeof(path), &attributes);
+    if (R_FAILED(result)) return result;
+
+    FsStorage storage = {0};
+    if (addon) {
+        result = fsOpenDataStorageByDataId(
+            &storage, status->application_id,
+            (NcmStorageId)status->storageID);
+        log_line("nup-romfs-open-data-id id=%016llX result=0x%08x",
+                 (unsigned long long)status->application_id, result);
+    } else {
+        result = MAKERESULT(Module_Libnx, LibnxError_NotFound);
+    }
+    if (R_FAILED(result))
+        result = open_data_storage_by_path(
+            &storage, path, attributes, proxy_type);
+    log_line("nup-romfs-open-storage id=%016llX type=%u result=0x%08x",
+             (unsigned long long)status->application_id,
+             status->meta_type, result);
+    if (R_SUCCEEDED(result)) {
+        Result mount_result = romfsMountFromStorage(storage, 0, "kdnrom");
+        log_line("nup-romfs-mount-storage id=%016llX result=0x%08x",
+                 (unsigned long long)status->application_id, mount_result);
+        if (R_SUCCEEDED(mount_result)) {
+            context->romfs_active = true;
+            context->romfs_device = true;
+            return 0;
+        }
+        fsStorageClose(&storage);
+        result = mount_result;
+    }
+
+    FsFileSystem filesystem = {0};
+    if (status->meta_type == NcmContentMetaType_Patch) {
+        result = fsOpenFileSystemWithPatch(
+            &filesystem, status->application_id, (FsFileSystemType)1);
+    } else {
+        result = fsOpenFileSystemWithId(
+            &filesystem, status->application_id,
+            (FsFileSystemType)proxy_type, path, attributes);
+    }
+    log_line("nup-romfs-open-filesystem id=%016llX type=%u result=0x%08x",
+             (unsigned long long)status->application_id,
+             status->meta_type, result);
+    if (R_SUCCEEDED(result)) {
+        int device = fsdevMountDevice("kdnrom", filesystem);
+        log_line("nup-romfs-mount-filesystem device=%d", device);
+        if (device >= 0) {
+            context->romfs_active = true;
+            context->romfs_device = false;
+            return 0;
+        }
+        result = MAKERESULT(Module_Libnx, LibnxError_TooManyDevOpTabs);
+    }
+    return result;
+}
+
+static Result mount_nup_source(const NupInput *input, NupMount *mount,
+                               void *user) {
+    NupMountContext *context = user;
+    unmount_nup_source(context);
+    if (input->source_id >= (u32)g.choice_count)
+        return MAKERESULT(Module_Libnx, LibnxError_BadInput);
+    ContentChoice *choice = &g.choices[input->source_id];
+    NsApplicationContentMetaStatus *status = &g.meta[choice->meta_index];
+    Result result = 0;
+
+    if (choice->kind == CONTENT_GAME) {
+        result = mount_nup_combined_exefs(choice, context);
+        if (R_SUCCEEDED(result)) {
+            bool romfs_device = false;
+            result = mount_title_romfs(
+                g.applications[g.selected].record.application_id,
+                &romfs_device);
+            if (R_SUCCEEDED(result)) {
+                context->romfs_active = true;
+                context->romfs_device = romfs_device;
+                context->romfs_combined_name = true;
+                snprintf(mount->romfs, sizeof(mount->romfs), "kdrom:/");
+            }
+        }
+    } else {
+        if (choice->kind == CONTENT_BASE || choice->kind == CONTENT_UPDATE) {
+            const NsApplicationContentMetaStatus *original = NULL;
+            if (choice->kind == CONTENT_UPDATE) {
+                for (s32 i = 0; i < g.meta_count; ++i) {
+                    if (g.meta[i].meta_type == NcmContentMetaType_Application) {
+                        original = &g.meta[i];
+                        break;
+                    }
+                }
+            }
+            result = mount_nup_exefs_status(
+                status, original,
+                g.applications[g.selected].record.application_id, context);
+        }
+        if (R_SUCCEEDED(result))
+            result = mount_nup_romfs_status(status, context);
+        if (R_SUCCEEDED(result))
+            snprintf(mount->romfs, sizeof(mount->romfs), "kdnrom:/");
+    }
+    if (R_SUCCEEDED(result) && context->exefs_active)
+        snprintf(mount->exefs, sizeof(mount->exefs), "kdnexe:/");
+    if (R_FAILED(result)) unmount_nup_source(context);
+    log_line("nup-source-mount choice=%u kind=%u id=%016llX result=0x%08x exefs=%s romfs=%s",
+             input->source_id, choice->kind,
+             (unsigned long long)input->title_id, result,
+             mount->exefs[0] ? mount->exefs : "-",
+             mount->romfs[0] ? mount->romfs : "-");
+    return result;
+}
+
+typedef struct {
+    PadState *pad;
+    const char *message;
+} NupUiContext;
+
+/* Shared progress callbacks --------------------------------------------- */
+
+static bool nup_cancelled(void *user) {
+    NupUiContext *context = user;
+    progress_tick(g.progress_total_bytes ? context->message : NULL);
+    return dump_cancelled(context->pad);
+}
+
+static bool ftp_stopped(void *user) {
+    return dump_cancelled((PadState *)user);
+}
+
+static void ftp_status(void *user, const char *status, uint64_t transferred) {
+    (void)user;
+    log_line("ftp-status message=%s transferred=%llu", status,
+             (unsigned long long)transferred);
+    if (!strncmp(status, "ftp://", 6))
+        snprintf(g.ftp_address, sizeof(g.ftp_address), "%s", status);
+    else
+        snprintf(g.status, sizeof(g.status), "%s", status);
+    if (transferred) g.copied_bytes = transferred;
+    g.screen = SCREEN_FTP;
+    draw_ftp();
+}
+
+static size_t build_nup_inputs(NupInput *inputs, size_t capacity) {
+    Application *app = &g.applications[g.selected];
+    size_t count = 0;
+    bool has_base = false;
+    for (s32 i = 0; i < g.choice_count && count < capacity; ++i) {
+        ContentChoice *choice = &g.choices[i];
+        if (!choice->selected) continue;
+        NsApplicationContentMetaStatus *meta = &g.meta[choice->meta_index];
+        NupInput *input = &inputs[count];
+        memset(input, 0, sizeof(*input));
+        input->source_id = (u32)i;
+        if (choice->kind == CONTENT_GAME) {
+            input->title_id = app->record.application_id;
+            input->version = choice->update_index >= 0
+                ? g.meta[choice->update_index].version : meta->version;
+            input->kind = NUP_KIND_BASE;
+            input->layout = NUP_LAYOUT_GAME;
+            has_base = true;
+        } else if (choice->kind == CONTENT_BASE) {
+            input->title_id = meta->application_id;
+            input->version = meta->version;
+            input->kind = NUP_KIND_BASE;
+            input->layout = NUP_LAYOUT_BASE;
+            has_base = true;
+        } else if (choice->kind == CONTENT_UPDATE) {
+            input->title_id = meta->application_id;
+            input->version = meta->version;
+            input->kind = NUP_KIND_UPDATE;
+            input->layout = NUP_LAYOUT_UPDATE;
+        } else {
+            input->title_id = meta->application_id;
+            input->version = meta->version;
+            input->kind = meta->meta_type == NcmContentMetaType_DataPatch
+                ? NUP_KIND_ADDON_UPDATE : NUP_KIND_ADDON;
+            input->layout = NUP_LAYOUT_DLC;
+        }
+        ++count;
+    }
+    if (!has_base) {
+        for (size_t i = 0; i < count; ++i)
+            if (inputs[i].kind == NUP_KIND_UPDATE) inputs[i].flags |= 1;
+    }
+    return count;
+}
+
+static Result nup_ftp_read(void *file, uint64_t offset, void *buffer,
+                           size_t size, size_t *bytes_read) {
+    return nupArchiveRead((NupArchive *)file, offset, buffer, size, bytes_read);
+}
+
+static Result tar_ftp_read(void *file, uint64_t offset, void *buffer,
+                           size_t size, size_t *bytes_read) {
+    return tarArchiveRead((TarArchive *)file, offset, buffer, size, bytes_read);
+}
+
+static Result create_selected_nup(const char *root, PadState *pad) {
+    Application *app = &g.applications[g.selected];
+    NupInput inputs[MAX_META_STATUS];
+    size_t count = build_nup_inputs(inputs, MAX_META_STATUS);
+    if (!count) return MAKERESULT(Module_Libnx, LibnxError_BadInput);
+
+    if (ensure_directory(root) != 0)
+        return MAKERESULT(Module_Libnx, LibnxError_IoError);
+    char output[576];
+    char name[256];
+    build_output_name(app, ".nup", name, sizeof(name));
+    snprintf(output, sizeof(output), "%s/%s", root, name);
+    NupMountContext mount_context = {0};
+    NupUiContext ui_context = {
+        .pad = pad,
+        .message = "Writing NUP directly to SD...",
+    };
+    draw_progress("Inventorying NUP contents...");
+    Result result = nupCreateDirect(
+        output, inputs, count, mount_nup_source, unmount_nup_source,
+        &mount_context, g_copy_buffer, COPY_BUFFER_SIZE,
+        nup_cancelled, &ui_context, &g.progress_total_bytes,
+        &g.copied_bytes, &g.copied_files);
+    log_line("nup-create path=%s result=0x%08x packages=%zu files=%llu bytes=%llu",
+             output, result, count, (unsigned long long)g.copied_files,
+             (unsigned long long)g.copied_bytes);
+    return result;
+}
+
+/* NUP output ------------------------------------------------------------- */
+
+static Result serve_selected_nup(PadState *pad) {
+    Application *app = &g.applications[g.selected];
+    NupInput inputs[MAX_META_STATUS];
+    size_t count = build_nup_inputs(inputs, MAX_META_STATUS);
+    if (!count) return MAKERESULT(Module_Libnx, LibnxError_BadInput);
+
+    NupMountContext mount_context = {0};
+    NupUiContext ui_context = {
+        .pad = pad,
+        .message = "Hashing content for virtual NUP...",
+    };
+    NupArchive *archive = NULL;
+    draw_progress("Inventorying virtual NUP contents...");
+    Result result = nupPrepareVirtual(
+        &archive, inputs, count, mount_nup_source, unmount_nup_source,
+        &mount_context, g_copy_buffer, COPY_BUFFER_SIZE,
+        nup_cancelled, &ui_context, &g.progress_total_bytes,
+        &g.copied_bytes, &g.copied_files);
+    log_line("nup-virtual-prepare result=0x%08x packages=%zu files=%llu hashed=%llu size=%llu",
+             result, count, (unsigned long long)g.copied_files,
+             (unsigned long long)g.copied_bytes,
+             (unsigned long long)nupArchiveSize(archive));
+    if (R_FAILED(result)) return result;
+
+    char name[256];
+    build_output_name(app, ".nup", name, sizeof(name));
+    g.copied_bytes = 0;
+    g.ftp_address[0] = 0;
+    snprintf(g.status, sizeof(g.status), "Starting virtual read-only FTP...");
+    g.screen = SCREEN_FTP;
+    draw_ftp();
+    result = ftpServeVirtualFile(
+        name, nupArchiveSize(archive), archive, nup_ftp_read, 5000,
+        ftp_stopped, ftp_status, pad);
+    log_line("ftp-finish virtual=%s result=0x%08x transferred=%llu",
+             name, result, (unsigned long long)g.copied_bytes);
+    nupArchiveClose(archive);
+    g.screen = SCREEN_RESULT;
+    if (R_SUCCEEDED(result))
+        snprintf(g.status, sizeof(g.status),
+                 "FTP server stopped; no dump data was written to SD");
+    return result;
+}
+
+/* USB MTP ---------------------------------------------------------------- */
+
+static void usb_worker_main(void *argument) {
+    mtp_run();
+    nupArchiveDeactivate((NupArchive *)argument);
+}
+
+static void log_usb_activity(void) {
+    app_status_t status;
+    status_snapshot(&status);
+    log_line("usb-status state=%u speed-mps=%u done=%llu total=%llu to-pc=%llu files=%u error=%s",
+             status.state, status.usb_speed_mps,
+             (unsigned long long)status.done,
+             (unsigned long long)status.total,
+             (unsigned long long)status.bytes_to_pc,
+             status.files_to_pc,
+             status.error[0] ? status.error : "-");
+    u32 first = status.log_head > STATUS_LOG_LINES
+        ? status.log_head - STATUS_LOG_LINES : 0;
+    for (u32 i = first; i < status.log_head; ++i)
+        log_line("usb-activity %s", status.log[i % STATUS_LOG_LINES]);
+}
+
+static Result run_usb_server(PadState *pad, NupArchive *archive,
+                             const char *root_path, const char *description,
+                             void (*unmount_virtual)(void)) {
+    Result result = 0;
+    status_init();
+    g_usb_stop = 0;
+    tp_set_stop_flag(&g_usb_stop);
+    tp_set_serial("KAIDUMP0001");
+    const mtp_config_t config = {
+        .root_path = root_path,
+        .storage_desc = description,
+        .manufacturer = "KaiDump contributors",
+        .model = "KaiDump",
+        .friendly_name = "KaiDump",
+        .version = "KaiDump " KAIDUMP_VERSION,
+        .serial = "KAIDUMP0001",
+        .stop = &g_usb_stop,
+    };
+
+    bool mtp_ready = mtp_init(&config);
+    log_line("usb-mtp-init ready=%u", mtp_ready ? 1u : 0u);
+    bool transport_ready = false;
+    bool thread_created = false;
+    bool thread_running = false;
+    if (!mtp_ready) {
+        result = MAKERESULT(Module_Libnx, LibnxError_OutOfMemory);
+        status_set_error("Could not allocate the USB transfer buffers.");
+    } else if (tp_init() != TP_OK) {
+        result = tp_last_result();
+        if (R_SUCCEEDED(result))
+            result = MAKERESULT(Module_Libnx, LibnxError_IoError);
+        log_line("usb-transport-init step=%s result=0x%08x",
+                 tp_last_step(), result);
+        status_set_error("USB setup failed at %s (0x%08x).",
+                         tp_last_step(), result);
+    } else {
+        transport_ready = true;
+        log_line("usb-transport-init step=%s result=0x%08x",
+                 tp_last_step(), tp_last_result());
+        result = threadCreate(&g_usb_thread, usb_worker_main, archive, NULL,
+                              0x20000, 0x2B, -2);
+        thread_created = R_SUCCEEDED(result);
+        if (thread_created) {
+            result = threadStart(&g_usb_thread);
+            thread_running = R_SUCCEEDED(result);
+        }
+        if (R_FAILED(result))
+            status_set_error("Could not start the USB transfer thread (0x%08x).",
+                             result);
+    }
+
+    if (thread_running) {
+        appletSetMediaPlaybackState(true);
+        g.copied_bytes = 0;
+        g.screen = SCREEN_USB;
+        draw_usb();
+        while (appletMainLoop()) {
+            uiPumpEvents();
+            padUpdate(pad);
+            if (buttons_pressed(pad) & HidNpadButton_B) break;
+            app_status_t status;
+            status_snapshot(&status);
+            g.copied_bytes = status.bytes_to_pc;
+            if (status.state == ST_TRANSFER)
+                g.copied_bytes += status.done;
+            draw_usb();
+            svcSleepThread(16000000ull);
+        }
+        g_usb_stop = 1;
+        log_line("usb-shutdown stop-requested");
+        threadWaitForExit(&g_usb_thread);
+        thread_running = false;
+        log_line("usb-shutdown worker-exited");
+        log_usb_activity();
+        result = 0;
+    }
+
+    g_usb_stop = 1;
+    if (thread_running) threadWaitForExit(&g_usb_thread);
+    if (thread_created) {
+        threadClose(&g_usb_thread);
+        log_line("usb-shutdown thread-closed");
+    }
+    if (transport_ready) {
+        tp_exit();
+        log_line("usb-shutdown transport-closed");
+    }
+    if (mtp_ready) {
+        mtp_exit();
+        log_line("usb-shutdown mtp-closed");
+    }
+    unmount_virtual();
+    log_line("usb-shutdown virtual-output-unmounted");
+    nupArchiveClose(archive);
+    log_line("usb-shutdown archive-closed");
+    appletSetMediaPlaybackState(false);
+    g.screen = SCREEN_RESULT;
+    if (R_SUCCEEDED(result))
+        snprintf(g.status, sizeof(g.status),
+                 "USB server stopped; no dump data was written to SD");
+    return result;
+}
+
+static Result serve_selected_usb(PadState *pad) {
+    Application *app = &g.applications[g.selected];
+    NupInput inputs[MAX_META_STATUS];
+    size_t count = build_nup_inputs(inputs, MAX_META_STATUS);
+    if (!count) return MAKERESULT(Module_Libnx, LibnxError_BadInput);
+
+    NupMountContext mount_context = {0};
+    NupUiContext ui_context = {
+        .pad = pad,
+        .message = "Hashing content for virtual USB NUP...",
+    };
+    NupArchive *archive = NULL;
+    draw_progress("Inventorying virtual USB NUP contents...");
+    Result result = nupPrepareVirtual(
+        &archive, inputs, count, mount_nup_source, unmount_nup_source,
+        &mount_context, g_copy_buffer, COPY_BUFFER_SIZE,
+        nup_cancelled, &ui_context, &g.progress_total_bytes,
+        &g.copied_bytes, &g.copied_files);
+    log_line("nup-usb-prepare result=0x%08x packages=%zu files=%llu hashed=%llu size=%llu",
+             result, count, (unsigned long long)g.copied_files,
+             (unsigned long long)g.copied_bytes,
+             (unsigned long long)nupArchiveSize(archive));
+    if (R_FAILED(result)) return result;
+
+    char name[256];
+    build_output_name(app, ".nup", name, sizeof(name));
+    result = virtualFileMount(
+        "kdnup", name, nupArchiveSize(archive), archive, nup_ftp_read);
+    log_result("usb-virtual-file-mount", result);
+    if (R_FAILED(result)) {
+        nupArchiveClose(archive);
+        return result;
+    }
+    return run_usb_server(pad, archive, "kdnup:",
+                          "KaiDump virtual NUP", virtualFileUnmount);
+}
+
+static Result prepare_selected_tree(PadState *pad, NupArchive **archive,
+                                    NupMountContext *mount_context,
+                                    const char *message) {
+    NupInput inputs[MAX_META_STATUS];
+    size_t count = build_nup_inputs(inputs, MAX_META_STATUS);
+    if (!count) return MAKERESULT(Module_Libnx, LibnxError_BadInput);
+    NupUiContext ui_context = {
+        .pad = pad,
+        .message = message,
+    };
+    g.copied_files = 0;
+    draw_progress(message);
+    Result result = nupPrepareTree(
+        archive, inputs, count, mount_nup_source, unmount_nup_source,
+        mount_context, nup_cancelled, &ui_context, &g.copied_files);
+    log_line("content-tree-prepare result=0x%08x packages=%zu files=%llu size=%llu",
+             result, count, (unsigned long long)g.copied_files,
+             (unsigned long long)nupTreeTotalSize(*archive));
+    return result;
+}
+
+static Result serve_selected_extracted_ftp(PadState *pad) {
+    NupMountContext mount_context = {0};
+    NupArchive *archive = NULL;
+    Result result = prepare_selected_tree(
+        pad, &archive, &mount_context, "Inventorying extracted files...");
+    if (R_FAILED(result)) return result;
+    result = virtualTreeMount("kdtree", archive);
+    log_result("ftp-virtual-tree-mount", result);
+    if (R_FAILED(result)) {
+        nupArchiveClose(archive);
+        return result;
+    }
+
+    g.copied_bytes = 0;
+    g.ftp_address[0] = 0;
+    snprintf(g.status, sizeof(g.status), "Starting extracted-file FTP...");
+    g.screen = SCREEN_FTP;
+    draw_ftp();
+    result = ftpServeDirectory("kdtree:", 5000, ftp_stopped,
+                               ftp_status, pad);
+    log_line("ftp-finish extracted result=0x%08x transferred=%llu",
+             result, (unsigned long long)g.copied_bytes);
+    virtualTreeUnmount();
+    nupArchiveClose(archive);
+    g.screen = SCREEN_RESULT;
+    if (R_SUCCEEDED(result))
+        snprintf(g.status, sizeof(g.status),
+                 "FTP server stopped; no dump data was written to SD");
+    return result;
+}
+
+static Result serve_selected_extracted_usb(PadState *pad) {
+    NupMountContext mount_context = {0};
+    NupArchive *archive = NULL;
+    Result result = prepare_selected_tree(
+        pad, &archive, &mount_context, "Inventorying extracted files...");
+    if (R_FAILED(result)) return result;
+    result = virtualTreeMount("kdtree", archive);
+    log_result("usb-virtual-tree-mount", result);
+    if (R_FAILED(result)) {
+        nupArchiveClose(archive);
+        return result;
+    }
+    return run_usb_server(pad, archive, "kdtree:",
+                          "KaiDump extracted files", virtualTreeUnmount);
+}
+
+static Result prepare_selected_tar(PadState *pad, NupArchive **tree,
+                                   TarArchive **tar,
+                                   NupMountContext *mount_context) {
+    Result result = prepare_selected_tree(
+        pad, tree, mount_context, "Inventorying TAR contents...");
+    if (R_SUCCEEDED(result)) result = tarPrepare(tar, *tree);
+    log_line("tar-prepare result=0x%08x files=%llu size=%llu",
+             result, (unsigned long long)g.copied_files,
+             (unsigned long long)tarArchiveSize(*tar));
+    if (R_FAILED(result) && *tree) {
+        nupArchiveClose(*tree);
+        *tree = NULL;
+    }
+    return result;
+}
+
+static Result create_selected_tar(const char *root, PadState *pad) {
+    Application *app = &g.applications[g.selected];
+    if (ensure_directory(root) != 0)
+        return MAKERESULT(Module_Libnx, LibnxError_IoError);
+    NupMountContext mount_context = {0};
+    NupArchive *tree = NULL;
+    TarArchive *tar = NULL;
+    Result result = prepare_selected_tar(pad, &tree, &tar, &mount_context);
+    if (R_FAILED(result)) return result;
+
+    char output[576];
+    char name[256];
+    build_output_name(app, ".tar", name, sizeof(name));
+    snprintf(output, sizeof(output), "%s/%s", root, name);
+    NupUiContext ui_context = {
+        .pad = pad,
+        .message = "Writing TAR directly to SD...",
+    };
+    g.copied_bytes = 0;
+    g.progress_total_bytes = tarArchiveSize(tar);
+    draw_progress(ui_context.message);
+    result = tarWriteDirect(output, tar, g_copy_buffer, COPY_BUFFER_SIZE,
+                            nup_cancelled, &ui_context, &g.copied_bytes);
+    log_line("tar-create path=%s result=0x%08x files=%llu bytes=%llu",
+             output, result, (unsigned long long)g.copied_files,
+             (unsigned long long)g.copied_bytes);
+    tarArchiveClose(tar);
+    nupArchiveClose(tree);
+    return result;
+}
+
+static Result serve_selected_tar_ftp(PadState *pad) {
+    Application *app = &g.applications[g.selected];
+    NupMountContext mount_context = {0};
+    NupArchive *tree = NULL;
+    TarArchive *tar = NULL;
+    Result result = prepare_selected_tar(pad, &tree, &tar, &mount_context);
+    if (R_FAILED(result)) return result;
+
+    char name[256];
+    build_output_name(app, ".tar", name, sizeof(name));
+    g.copied_bytes = 0;
+    g.ftp_address[0] = 0;
+    snprintf(g.status, sizeof(g.status), "Starting virtual read-only TAR FTP...");
+    g.screen = SCREEN_FTP;
+    draw_ftp();
+    result = ftpServeVirtualFile(
+        name, tarArchiveSize(tar), tar, tar_ftp_read, 5000,
+        ftp_stopped, ftp_status, pad);
+    log_line("ftp-finish virtual-tar=%s result=0x%08x transferred=%llu",
+             name, result, (unsigned long long)g.copied_bytes);
+    tarArchiveClose(tar);
+    nupArchiveClose(tree);
+    g.screen = SCREEN_RESULT;
+    if (R_SUCCEEDED(result))
+        snprintf(g.status, sizeof(g.status),
+                 "FTP server stopped; no dump data was written to SD");
+    return result;
+}
+
+static Result serve_selected_tar_usb(PadState *pad) {
+    Application *app = &g.applications[g.selected];
+    NupMountContext mount_context = {0};
+    NupArchive *tree = NULL;
+    TarArchive *tar = NULL;
+    Result result = prepare_selected_tar(pad, &tree, &tar, &mount_context);
+    if (R_FAILED(result)) return result;
+
+    char name[256];
+    build_output_name(app, ".tar", name, sizeof(name));
+    result = virtualFileMount(
+        "kdtar", name, tarArchiveSize(tar), tar, tar_ftp_read);
+    log_result("usb-virtual-tar-mount", result);
+    if (R_FAILED(result)) {
+        tarArchiveClose(tar);
+        nupArchiveClose(tree);
+        return result;
+    }
+    result = run_usb_server(pad, tree, "kdtar:",
+                            "KaiDump virtual TAR", virtualFileUnmount);
+    tarArchiveClose(tar);
+    return result;
+}
+
+void dump_title(PadState *pad) {
+    Application *app = &g.applications[g.selected];
+    g.copied_bytes = 0;
+    g.copied_files = 0;
+    g.status[0] = 0;
+    g.screen = SCREEN_RESULT;
+
+    log_line("export-start title=%016llX name=%s mode=%s destination=%s choices=%d selected=%d",
+             (unsigned long long)app->record.application_id,
+             app->title[0] ? app->title : "(unavailable)",
+             g.output_format == OUTPUT_NUP ? "nup"
+                 : g.output_format == OUTPUT_TAR ? "tar" : "extracted",
+             g.usb_enabled ? "usb" : g.ftp_enabled ? "ftp" : "sd",
+             g.choice_count,
+             selected_content_count());
+    for (s32 i = 0; i < g.choice_count; ++i) {
+        const ContentChoice *choice = &g.choices[i];
+        const NsApplicationContentMetaStatus *meta =
+            choice->meta_index >= 0 && choice->meta_index < g.meta_count
+                ? &g.meta[choice->meta_index] : NULL;
+        const NsApplicationContentMetaStatus *update =
+            choice->update_index >= 0 && choice->update_index < g.meta_count
+                ? &g.meta[choice->update_index] : NULL;
+        log_line("export-choice index=%d selected=%u kind=%u meta-index=%d update-index=%d id=%016llX meta-type=%u storage=%u version=%u update-id=%016llX update-storage=%u update-version=%u",
+                 i, choice->selected, choice->kind, choice->meta_index,
+                 choice->update_index,
+                 (unsigned long long)(meta ? meta->application_id : 0),
+                 meta ? meta->meta_type : 0, meta ? meta->storageID : 0,
+                 meta ? meta->version : 0,
+                 (unsigned long long)(update ? update->application_id : 0),
+                 update ? update->storageID : 0,
+                 update ? update->version : 0);
+    }
+
+    if (!hosversionIsKaiHEN()) {
+        g.dump_result = MAKERESULT(Module_Libnx, LibnxError_NotFound);
+        snprintf(g.status, sizeof(g.status), "kaiHEN was not detected; dump refused");
+        log_line("romfs-refused title=%016llX reason=no-kaiHEN",
+                 (unsigned long long)app->record.application_id);
+        return;
+    }
+    if (g.ftp_enabled) {
+        refresh_ftp_availability();
+        if (!g.ftp_available) {
+            g.dump_result = g.ftp_network_result;
+            snprintf(g.status, sizeof(g.status),
+                     "FTP unavailable; connect the console to a local network");
+            log_result("ftp-network-required", g.dump_result);
+            return;
+        }
+    }
+    g_copy_buffer = malloc(COPY_BUFFER_SIZE);
+    if (!g_copy_buffer) {
+        g.dump_result = MAKERESULT(Module_Libnx, LibnxError_OutOfMemory);
+        snprintf(g.status, sizeof(g.status), "Could not allocate the 1 MiB copy buffer");
+        log_line("romfs-refused title=%016llX reason=out-of-memory",
+                 (unsigned long long)app->record.application_id);
+        return;
+    }
+
+    progress_begin("Preparing selected content...");
+
+    char root[320];
+    char output_name[256];
+    build_output_name(app, "", output_name, sizeof(output_name));
+    snprintf(root, sizeof(root),
+             "sdmc:/switch/KaiDump/dumps/%s", output_name);
+    g.dump_result = 0;
+    int completed = selected_content_count();
+    if (g.usb_enabled) {
+        g.dump_result = g.output_format == OUTPUT_NUP
+            ? serve_selected_usb(pad)
+            : g.output_format == OUTPUT_TAR
+                ? serve_selected_tar_usb(pad)
+                : serve_selected_extracted_usb(pad);
+    } else if (g.ftp_enabled) {
+        g.dump_result = g.output_format == OUTPUT_NUP
+            ? serve_selected_nup(pad)
+            : g.output_format == OUTPUT_TAR
+                ? serve_selected_tar_ftp(pad)
+                : serve_selected_extracted_ftp(pad);
+    } else if (g.output_format == OUTPUT_NUP) {
+        g.dump_result = create_selected_nup(root, pad);
+    } else if (g.output_format == OUTPUT_TAR) {
+        g.dump_result = create_selected_tar(root, pad);
+    } else {
+        completed = 0;
+        NupMountContext measure_context = {0};
+        NupArchive *measure_tree = NULL;
+        g.dump_result = prepare_selected_tree(
+            pad, &measure_tree, &measure_context,
+            "Inventorying extracted files...");
+        if (R_SUCCEEDED(g.dump_result)) {
+            g.progress_total_bytes = nupTreeTotalSize(measure_tree);
+            nupArchiveClose(measure_tree);
+            g.copied_bytes = 0;
+            g.copied_files = 0;
+            draw_progress("Starting extracted copy...");
+            for (s32 i = 0; i < g.choice_count; ++i) {
+                ContentChoice *choice = &g.choices[i];
+                if (!choice->selected) continue;
+                Result result = choice->kind == CONTENT_GAME
+                    ? export_combined_game(app->record.application_id, root, pad)
+                    : export_selected_content(&g.meta[choice->meta_index], root, pad);
+                if (R_FAILED(result)) {
+                    g.dump_result = result;
+                    break;
+                }
+                ++completed;
+            }
+        }
+    }
+    g.progress_active = false;
+    if (R_SUCCEEDED(g.dump_result)) {
+        if (!g.ftp_enabled && !g.usb_enabled)
+            snprintf(g.status, sizeof(g.status),
+                     g.output_format == OUTPUT_NUP
+                         ? "%d selected content package%s archived as NUP"
+                         : g.output_format == OUTPUT_TAR
+                             ? "%d selected content package%s archived as TAR"
+                             : "%d selected content package%s exported successfully",
+                     completed, completed == 1 ? "" : "s");
+    } else if (R_MODULE(g.dump_result) == Module_Libnx &&
+               R_DESCRIPTION(g.dump_result) == KAIDUMP_ERROR_CANCELED) {
+        snprintf(g.status, sizeof(g.status),
+                 (g.ftp_enabled || g.usb_enabled)
+                     ? "Cancelled; no dump data was written to SD"
+                     : "Cancelled; partial output was kept");
+    } else {
+        snprintf(g.status, sizeof(g.status),
+                 "One content section failed; successful output was kept");
+    }
+    free(g_copy_buffer);
+    g_copy_buffer = NULL;
+    log_line("export-finish result=0x%08x packages=%d files=%llu bytes=%llu status=%s",
+             g.dump_result, completed, (unsigned long long)g.copied_files,
+             (unsigned long long)g.copied_bytes, g.status);
+}
