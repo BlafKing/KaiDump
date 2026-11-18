@@ -133,6 +133,8 @@ typedef struct {
     u64 progress_started_tick;
     u64 progress_last_frame_tick;
     char progress_detail[768];
+    char progress_files_label[32];
+    char progress_bytes_label[32];
     bool progress_active;
     char status[160];
     char ftp_address[256];
@@ -180,6 +182,7 @@ void draw(void);
 u64 buttons_pressed(PadState *pad);
 int selected_content_count(void);
 void progress_begin(const char *detail);
+void progress_set_labels(const char *files, const char *bytes);
 void progress_tick(const char *detail);
 bool dump_cancelled(PadState *pad);
 int ensure_directory(const char *path);

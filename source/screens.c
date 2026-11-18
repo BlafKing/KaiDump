@@ -635,11 +635,15 @@ static void draw_result(void) {
     char bytes[48];
     format_size(bytes, sizeof(bytes), g.copied_bytes);
     uiFillRoundedRect(250, 330, 370, 106, 12, COLOR_PANEL_LIGHT);
-    uiDrawText(274, 350, 16, COLOR_MUTED, "FILES COPIED");
+    uiDrawText(274, 350, 16, COLOR_MUTED,
+               g.progress_files_label[0]
+                   ? g.progress_files_label : "FILES COPIED");
     uiDrawTextf(274, 382, 29, COLOR_TEXT, "%llu",
                 (unsigned long long)g.copied_files);
     uiFillRoundedRect(650, 330, 380, 106, 12, COLOR_PANEL_LIGHT);
-    uiDrawText(674, 350, 16, COLOR_MUTED, "DATA COPIED");
+    uiDrawText(674, 350, 16, COLOR_MUTED,
+               g.progress_bytes_label[0]
+                   ? g.progress_bytes_label : "DATA COPIED");
     uiDrawText(674, 382, 29, COLOR_TEXT, bytes);
 
     if (!succeeded)
@@ -680,11 +684,19 @@ u64 buttons_pressed(PadState *pad) {
     return pressed;
 }
 
+void progress_set_labels(const char *files, const char *bytes) {
+    snprintf(g.progress_files_label, sizeof(g.progress_files_label), "%s",
+             files && files[0] ? files : "FILES COPIED");
+    snprintf(g.progress_bytes_label, sizeof(g.progress_bytes_label), "%s",
+             bytes && bytes[0] ? bytes : "DATA COPIED");
+}
+
 void progress_begin(const char *detail) {
     g.progress_total_bytes = 0;
     g.progress_started_tick = armGetSystemTick();
     g.progress_last_frame_tick = 0;
     g.progress_detail[0] = 0;
+    progress_set_labels(NULL, NULL);
     g.progress_active = true;
     draw_progress(detail);
 }
@@ -741,11 +753,15 @@ void draw_progress(const char *relative) {
     char bytes[48];
     format_size(bytes, sizeof(bytes), g.copied_bytes);
     uiFillRoundedRect(198, 278, 410, 102, 12, COLOR_PANEL_LIGHT);
-    uiDrawText(222, 298, 16, COLOR_MUTED, "FILES COPIED");
+    uiDrawText(222, 298, 16, COLOR_MUTED,
+               g.progress_files_label[0]
+                   ? g.progress_files_label : "FILES COPIED");
     uiDrawTextf(222, 330, 28, COLOR_TEXT, "%llu",
                 (unsigned long long)g.copied_files);
     uiFillRoundedRect(628, 278, 454, 102, 12, COLOR_PANEL_LIGHT);
-    uiDrawText(652, 298, 16, COLOR_MUTED, "DATA COPIED");
+    uiDrawText(652, 298, 16, COLOR_MUTED,
+               g.progress_bytes_label[0]
+                   ? g.progress_bytes_label : "DATA COPIED");
     uiDrawText(652, 330, 28, COLOR_TEXT, bytes);
 
     const int bar_width = 884;

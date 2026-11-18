@@ -610,6 +610,7 @@ static Result create_selected_tar(const char *root, PadState *pad) {
         .pad = pad,
         .message = "Writing TAR directly to SD...",
     };
+    progress_set_labels("FILES IN ARCHIVE", "ARCHIVE WRITTEN");
     g.copied_bytes = 0;
     g.progress_total_bytes = tarArchiveSize(tar);
     draw_progress(ui_context.message);
@@ -630,6 +631,7 @@ static Result serve_selected_tar_ftp(PadState *pad) {
     TarArchive *tar = NULL;
     Result result = prepare_selected_tar(pad, &tree, &tar, &mount_context);
     if (R_FAILED(result)) return result;
+    progress_set_labels("FILES IN ARCHIVE", "DATA TRANSFERRED");
 
     char name[256];
     build_output_name(app, ".tar", name, sizeof(name));
@@ -659,6 +661,7 @@ static Result serve_selected_tar_usb(PadState *pad) {
     TarArchive *tar = NULL;
     Result result = prepare_selected_tar(pad, &tree, &tar, &mount_context);
     if (R_FAILED(result)) return result;
+    progress_set_labels("FILES IN ARCHIVE", "DATA TRANSFERRED");
 
     char name[256];
     build_output_name(app, ".tar", name, sizeof(name));
