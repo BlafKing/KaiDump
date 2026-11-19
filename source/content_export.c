@@ -37,19 +37,15 @@ static Result copy_tree(const char *source, const char *destination,
             break;
         }
 
-        bool is_directory = entry->d_type == DT_DIR;
-        bool is_regular = entry->d_type == DT_REG;
-        if (entry->d_type == DT_UNKNOWN) {
-            struct stat st;
-            if (stat(src, &st) != 0) {
-                log_line("copy-stat source=%s type=%u errno=%d", src,
-                         entry->d_type, errno);
-                result = MAKERESULT(Module_Libnx, LibnxError_IoError);
-                break;
-            }
-            is_directory = S_ISDIR(st.st_mode);
-            is_regular = S_ISREG(st.st_mode);
+        struct stat st;
+        if (stat(src, &st) != 0) {
+            log_line("copy-stat source=%s type=%u errno=%d", src,
+                     entry->d_type, errno);
+            result = MAKERESULT(Module_Libnx, LibnxError_IoError);
+            break;
         }
+        bool is_directory = S_ISDIR(st.st_mode);
+        bool is_regular = S_ISREG(st.st_mode);
         if (is_directory) {
             result = copy_tree(src, dst, rel, pad);
             if (R_FAILED(result)) break;
@@ -70,22 +66,25 @@ static Result copy_tree(const char *source, const char *destination,
             result = MAKERESULT(Module_Libnx, LibnxError_IoError);
             break;
         }
+        setvbuf(in, NULL, _IONBF, 0);
         draw_progress(rel);
-        for (;;) {
-            size_t got = fread(g_copy_buffer, 1, COPY_BUFFER_SIZE, in);
-            if (got && fwrite(g_copy_buffer, 1, got, out) != got) {
+        uint64_t offset = 0;
+        while (offset < (uint64_t)st.st_size) {
+            size_t wanted = (uint64_t)st.st_size - offset > COPY_BUFFER_SIZE
+                ? COPY_BUFFER_SIZE : (size_t)((uint64_t)st.st_size - offset);
+            result = sourceReadExact(in, src, offset, g_copy_buffer, wanted);
+            if (R_FAILED(result)) {
+                log_line("copy-read source=%s offset=%llu size=%zu result=0x%08x",
+                         src, (unsigned long long)offset, wanted, result);
+                break;
+            }
+            if (fwrite(g_copy_buffer, 1, wanted, out) != wanted) {
                 log_line("copy-write destination=%s errno=%d", dst, errno);
                 result = MAKERESULT(Module_Libnx, LibnxError_IoError);
                 break;
             }
-            g.copied_bytes += got;
-            if (got < COPY_BUFFER_SIZE) {
-                if (ferror(in)) {
-                    log_line("copy-read source=%s errno=%d", src, errno);
-                    result = MAKERESULT(Module_Libnx, LibnxError_IoError);
-                }
-                break;
-            }
+            offset += wanted;
+            g.copied_bytes += wanted;
             if (dump_cancelled(pad)) {
                 result = MAKERESULT(Module_Libnx, KAIDUMP_ERROR_CANCELED);
                 break;

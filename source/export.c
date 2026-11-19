@@ -683,8 +683,11 @@ void dump_title(PadState *pad) {
     Application *app = &g.applications[g.selected];
     g.copied_bytes = 0;
     g.copied_files = 0;
+    sourceIoResetError();
     g.status[0] = 0;
     g.screen = SCREEN_RESULT;
+    g.romfs_base_only = false;
+    g.romfs_self_matched = false;
 
     log_line("export-start title=%016llX name=%s mode=%s destination=%s choices=%d selected=%d",
              (unsigned long long)app->record.application_id,
@@ -801,15 +804,39 @@ void dump_title(PadState *pad) {
                              ? "%d selected content package%s archived as TAR"
                              : "%d selected content package%s exported successfully",
                      completed, completed == 1 ? "" : "s");
+        if (g.romfs_base_only)
+            snprintf(g.status, sizeof(g.status),
+                     "Warning: the update's RomFS was unavailable, so the base version was used (see KaiDump.log)");
     } else if (R_MODULE(g.dump_result) == Module_Libnx &&
                R_DESCRIPTION(g.dump_result) == KAIDUMP_ERROR_CANCELED) {
         snprintf(g.status, sizeof(g.status),
                  (g.ftp_enabled || g.usb_enabled)
                      ? "Cancelled; no dump data was written to SD"
                      : "Cancelled; partial output was kept");
-    } else {
+    } else if (sourceIoHadReadError()) {
         snprintf(g.status, sizeof(g.status),
-                 "One content section failed; successful output was kept");
+                 "RomFS read failed; retry or verify the installed game data");
+    } else if (R_MODULE(g.dump_result) == Module_Libnx &&
+               R_DESCRIPTION(g.dump_result) == TAR_ERROR_FAT32_LIMIT) {
+        snprintf(g.status, sizeof(g.status),
+                 "The SD card is FAT32 and cannot store this TAR; use FTP, USB, or Extracted Files");
+    } else {
+        char code[16];
+        format_result_code(code, sizeof(code), g.dump_result);
+        if (R_VALUE(g.dump_result) == 0x7d802) {
+            snprintf(g.status, sizeof(g.status),
+                     g.romfs_self_matched
+                         ? "Update key unavailable (%s) even inside the game; see KaiDump.log"
+                         : "Update key unavailable (%s). Start hbmenu through this game, then retry",
+                     code);
+        } else if (!g.copied_files && !g.copied_bytes) {
+            snprintf(g.status, sizeof(g.status),
+                     "Export failed (%s); nothing was written", code);
+        } else {
+            snprintf(g.status, sizeof(g.status),
+                     "One content section failed (%s); successful output was kept",
+                     code);
+        }
     }
     free(g_copy_buffer);
     g_copy_buffer = NULL;

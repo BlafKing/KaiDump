@@ -38,6 +38,8 @@ needs to inspect and hash every file first.
 4. Choose SD card, FTP, or USB as the destination.
 5. Review the selection and start the export.
 
+If a title fails, try starting kaiHEN through that title, then launch KaiDump from the same hbmenu session and retry.
+
 SD card exports are saved under:
 
 ```text

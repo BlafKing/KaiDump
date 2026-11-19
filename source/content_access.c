@@ -622,6 +622,24 @@ Result load_control_from_content(Application *app) {
 
 /* RomFS ------------------------------------------------------------------ */
 
+static bool result_is_missing_external_key(Result result);
+
+static int romfs_failure_rank(Result result) {
+    if (R_SUCCEEDED(result)) return -1;
+    const u32 value = R_VALUE(result);
+    if (value == 0x7d802) return 3;
+    if (value == 0x7d202) return 2;
+    if (value == 0x2ee202 ||
+        value == R_VALUE(MAKERESULT(Module_Libnx, LibnxError_NotFound)))
+        return 0;
+    return 1;
+}
+
+static Result prefer_romfs_failure(Result kept, Result candidate) {
+    return romfs_failure_rank(candidate) > romfs_failure_rank(kept)
+        ? candidate : kept;
+}
+
 static Result mount_explicit_program_content(u64 application_id,
                                              bool *romfs_device) {
     Result result = ncmInitialize();
@@ -634,10 +652,14 @@ static Result mount_explicit_program_content(u64 application_id,
         NcmContentMetaType_Application,
     };
     Result last = MAKERESULT(Module_Libnx, LibnxError_NotFound);
+    Result reported = 0;
+    bool update_failed = false;
     for (size_t wanted = 0; wanted < sizeof(wanted_types); ++wanted) {
         for (s32 i = 0; i < g.meta_count; ++i) {
             NsApplicationContentMetaStatus *status = &g.meta[i];
             if (status->meta_type != wanted_types[wanted]) continue;
+            const bool is_update =
+                status->meta_type == NcmContentMetaType_Patch;
 
             NcmContentMetaDatabase database = {0};
             NcmContentStorage storage = {0};
@@ -665,7 +687,11 @@ static Result mount_explicit_program_content(u64 application_id,
                          status->meta_type, status->version, last);
                 ncmContentMetaDatabaseClose(&database);
             }
-            if (R_FAILED(last)) continue;
+            if (R_FAILED(last)) {
+                reported = prefer_romfs_failure(reported, last);
+                if (is_update) update_failed = true;
+                continue;
+            }
 
             last = ncmOpenContentStorage(&storage, status->storageID);
             log_line("ncm-open-storage storage=%u result=0x%08x",
@@ -673,34 +699,49 @@ static Result mount_explicit_program_content(u64 application_id,
             if (R_SUCCEEDED(last)) {
                 last = ncmContentStorageGetPath(
                     &storage, path, sizeof(path), &content_id);
-                if (R_SUCCEEDED(last)) {
-                    Result license_result = prepare_installed_license(
-                        &storage, &content_id,
-                        (FsContentAttributes)content_attributes);
-                    if (R_FAILED(license_result))
-                        log_line("license preparation did not complete; trying FS open");
-                }
                 log_line("ncm-content-path result=0x%08x path=%s", last,
                          R_SUCCEEDED(last) ? path : "(unavailable)");
-                ncmContentStorageClose(&storage);
+                if (R_FAILED(last)) ncmContentStorageClose(&storage);
             }
-            if (R_FAILED(last)) continue;
+            if (R_FAILED(last)) {
+                reported = prefer_romfs_failure(reported, last);
+                if (is_update) update_failed = true;
+                continue;
+            }
 
             FsStorage data_storage = {0};
             last = open_data_storage_by_path(
                 &data_storage, path, (FsContentAttributes)content_attributes, 1);
-            log_line("fs-open-storage-path type=%u attributes=%u result=0x%08x",
+            log_line("fs-open-storage-path type=%u attributes=%u stage=before-license result=0x%08x",
                      status->meta_type, content_attributes, last);
+            if (result_is_missing_external_key(last)) {
+                Result license_result = prepare_installed_license(
+                    &storage, &content_id,
+                    (FsContentAttributes)content_attributes);
+                if (R_FAILED(license_result))
+                    log_line("license preparation did not complete; trying FS open");
+                last = open_data_storage_by_path(
+                    &data_storage, path,
+                    (FsContentAttributes)content_attributes, 1);
+                log_line("fs-open-storage-path type=%u attributes=%u stage=after-license result=0x%08x",
+                         status->meta_type, content_attributes, last);
+            }
+            ncmContentStorageClose(&storage);
             if (R_SUCCEEDED(last)) {
                 last = romfsMountFromStorage(data_storage, 0, "kdrom");
                 log_line("romfs-storage-path type=%u result=0x%08x",
                          status->meta_type, last);
                 if (R_SUCCEEDED(last)) {
+                    if (!is_update && update_failed) {
+                        g.romfs_base_only = true;
+                        log_line("romfs-warning base-only: the update RomFS could not be opened; this RomFS is the base version without the update");
+                    }
                     *romfs_device = true;
                     ncmExit();
                     return 0;
                 }
             }
+            reported = prefer_romfs_failure(reported, last);
 
             FsFileSystem filesystem = {0};
             last = fsOpenFileSystemWithId(
@@ -712,6 +753,10 @@ static Result mount_explicit_program_content(u64 application_id,
                 int device = fsdevMountDevice("kdrom", filesystem);
                 log_line("fsdev-mount-content device=%d", device);
                 if (device >= 0) {
+                    if (!is_update && update_failed) {
+                        g.romfs_base_only = true;
+                        log_line("romfs-warning base-only: the update RomFS could not be opened; this RomFS is the base version without the update");
+                    }
                     ncmExit();
                     return 0;
                 }
@@ -719,16 +764,30 @@ static Result mount_explicit_program_content(u64 application_id,
                     Module_Libnx, LibnxError_TooManyDevOpTabs);
                 log_result("fsdev-mount-content", last);
             }
+            reported = prefer_romfs_failure(reported, last);
+            if (is_update) update_failed = true;
         }
     }
     ncmExit();
+    if (R_FAILED(reported)) {
+        log_line("romfs-explicit-failure reported=0x%08x canonical=0x%06x name=%s last=0x%08x",
+                 reported, R_VALUE(reported), result_name(reported), last);
+        return reported;
+    }
     return last;
 }
 
 static Result mount_native_title_romfs(u64 application_id,
                                        bool *romfs_device);
+static Result mount_self_title_romfs(u64 application_id,
+                                     bool *romfs_device);
 
 Result mount_title_romfs(u64 application_id, bool *romfs_device) {
+    Result self_result = mount_self_title_romfs(application_id, romfs_device);
+    log_line("romfs-self-title title=%016llX result=0x%08x",
+             (unsigned long long)application_id, self_result);
+    if (R_SUCCEEDED(self_result)) return 0;
+
     Result native_result = mount_native_title_romfs(
         application_id, romfs_device);
     log_line("romfs-native-title title=%016llX result=0x%08x",
@@ -756,7 +815,9 @@ Result mount_title_romfs(u64 application_id, bool *romfs_device) {
     }
 
     *romfs_device = false;
-    return mount_explicit_program_content(application_id, romfs_device);
+    result = mount_explicit_program_content(application_id, romfs_device);
+    if (R_SUCCEEDED(result)) return result;
+    return prefer_romfs_failure(result, self_result);
 }
 
 /* ExeFS ------------------------------------------------------------------ */
@@ -1159,10 +1220,124 @@ static Result mount_native_title_romfs(u64 application_id,
     return R_FAILED(result) ? result : storage_result;
 }
 
+/* When KaiDump is launched through the selected game, this session lets FS
+ * return the same patched RomFS that the running game sees. This is useful
+ * for titles whose update key cannot be prepared through ES. */
+static Service g_self_fs;
+static bool g_self_fs_active;
+
+static void close_self_filesystem_session(void) {
+    if (!g_self_fs_active) return;
+    serviceClose(&g_self_fs);
+    g_self_fs_active = false;
+    log_line("romfs-self-session-closed");
+}
+
+static Result open_self_filesystem_session(void) {
+    if (g_self_fs_active) return 0;
+
+    Handle session = INVALID_HANDLE;
+    Result result = smGetServiceOriginal(&session, smEncodeName("fsp-srv"));
+    log_line("romfs-self-session-open result=0x%08x", result);
+    if (R_FAILED(result)) return result;
+
+    serviceCreate(&g_self_fs, session);
+    const u64 pid_placeholder = 0;
+    result = serviceDispatchIn(&g_self_fs, 1, pid_placeholder,
+        .in_send_pid = true,
+    );
+    log_result("romfs-self-set-current-process", result);
+    if (R_FAILED(result)) {
+        serviceClose(&g_self_fs);
+        return result;
+    }
+
+    g_self_fs_active = true;
+    return 0;
+}
+
+static Result open_self_data_storage(FsStorage *out) {
+    Result result = open_self_filesystem_session();
+    if (R_FAILED(result)) return result;
+
+    result = serviceDispatch(&g_self_fs, 200,
+        .out_num_objects = 1,
+        .out_objects = &out->s,
+    );
+    log_result("romfs-self-open-current-process", result);
+    if (R_SUCCEEDED(result)) return 0;
+
+    const u8 program_index = 0;
+    Result index_result = serviceDispatchIn(&g_self_fs, 205, program_index,
+        .out_num_objects = 1,
+        .out_objects = &out->s,
+    );
+    log_result("romfs-self-open-program-index", index_result);
+    return R_SUCCEEDED(index_result) ? 0 : result;
+}
+
+static Result mount_self_title_romfs(u64 application_id,
+                                     bool *romfs_device) {
+    close_self_filesystem_session();
+    g.romfs_self_matched = false;
+
+    u64 process_program_id = 0;
+    Result id_result = svcGetInfo(&process_program_id, InfoType_ProgramId,
+                                  CUR_PROCESS_HANDLE, 0);
+    if (R_FAILED(id_result)) process_program_id = 0;
+
+    u64 runtime_program_id = 0;
+    bool matches = process_program_id && process_program_id == application_id;
+    if (process_program_id && !matches) {
+        const NsApplicationContentMetaStatus *base =
+            find_program_status(NcmContentMetaType_Application);
+        const NsApplicationContentMetaStatus *update =
+            find_program_status(NcmContentMetaType_Patch);
+        const NsApplicationContentMetaStatus *selected = update ? update : base;
+        if (selected) {
+            char path[FS_MAX_PATH] = {0};
+            FsContentAttributes attributes = 0;
+            u8 program_index = 0;
+            Result resolve_result = resolve_installed_content_info(
+                selected, NcmContentType_Program, path, sizeof(path),
+                &attributes, &runtime_program_id, &program_index);
+            if (R_FAILED(resolve_result)) runtime_program_id = 0;
+            matches = runtime_program_id &&
+                      process_program_id == runtime_program_id;
+        }
+    }
+
+    log_line("romfs-self-check process=%016llX id-result=0x%08x application=%016llX runtime=%016llX match=%u",
+             (unsigned long long)process_program_id, id_result,
+             (unsigned long long)application_id,
+             (unsigned long long)runtime_program_id, matches);
+    if (!matches) return MAKERESULT(Module_Libnx, LibnxError_NotFound);
+    g.romfs_self_matched = true;
+
+    FsStorage storage = {0};
+    Result result = open_self_data_storage(&storage);
+    if (R_SUCCEEDED(result)) {
+        s64 size = 0;
+        Result size_result = fsStorageGetSize(&storage, &size);
+        log_line("romfs-self-storage size-result=0x%08x size=%lld",
+                 size_result, (long long)size);
+        result = romfsMountFromStorage(storage, 0, "kdrom");
+        log_line("romfs-self-mount result=0x%08x", result);
+        if (R_SUCCEEDED(result)) {
+            *romfs_device = true;
+            return 0;
+        }
+    }
+
+    close_self_filesystem_session();
+    return result;
+}
+
 void unmount_title_romfs(const char *name, bool romfs_device) {
     if (romfs_device) romfsUnmount(name);
     else fsdevUnmountDevice(name);
     end_native_romfs_context();
+    close_self_filesystem_session();
 }
 
 static bool result_is_missing_program_location(Result result) {

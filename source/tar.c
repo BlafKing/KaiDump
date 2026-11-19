@@ -1,14 +1,18 @@
 #include "tar.h"
 
+#include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/statvfs.h>
 #include <unistd.h>
 
 #define TAR_BLOCK_SIZE 512
 #define TAR_END_SIZE (TAR_BLOCK_SIZE * 2)
 #define TAR_MAX_OCTAL_SIZE 077777777777ULL
 #define TAR_CANCELED MAKERESULT(Module_Libnx, 200)
+
+void log_line(const char *format, ...);
 
 typedef struct {
     char name[100];
@@ -56,6 +60,37 @@ struct TarArchive {
 
 static Result io_error(void) {
     return MAKERESULT(Module_Libnx, LibnxError_IoError);
+}
+
+static bool sd_free_space(uint64_t *available) {
+    struct statvfs info;
+    if (statvfs("sdmc:/", &info) != 0 || !info.f_frsize ||
+        info.f_bavail > UINT64_MAX / info.f_frsize)
+        return false;
+    *available = (uint64_t)info.f_bavail * info.f_frsize;
+    return true;
+}
+
+static Result output_resize_error(const char *path, uint64_t size) {
+    const int resize_errno = errno;
+    const Result native_result = fsdevGetLastResult();
+    uint64_t available = 0;
+    const bool space_known = sd_free_space(&available);
+    const bool over_fat32_limit = size > UINT32_MAX;
+    const bool likely_fat32 = over_fat32_limit &&
+        (resize_errno == EFBIG || (space_known && available >= size));
+
+    if (likely_fat32) {
+        log_line("tar-write-fat32-limit path=%s size=%llu limit=%u errno=%d native=0x%08x available=%llu message=SD card is formatted as FAT32 and cannot store files larger than 4 GiB; use TAR over FTP or USB, or use Extracted Files",
+                 path, (unsigned long long)size, UINT32_MAX, resize_errno,
+                 native_result, (unsigned long long)available);
+        return MAKERESULT(Module_Libnx, TAR_ERROR_FAT32_LIMIT);
+    }
+
+    log_line("tar-write-resize-failed path=%s size=%llu errno=%d native=0x%08x space-known=%u available=%llu",
+             path, (unsigned long long)size, resize_errno, native_result,
+             space_known, (unsigned long long)available);
+    return io_error();
 }
 
 static uint64_t align_block(uint64_t value) {
@@ -374,7 +409,12 @@ Result tarWriteDirect(const char *output_path, TarArchive *archive,
         return MAKERESULT(Module_Libnx, LibnxError_BadInput);
     if (written_bytes) *written_bytes = 0;
     FILE *output = fopen(output_path, "wb+");
-    if (!output) return io_error();
+    if (!output) {
+        const int open_errno = errno;
+        log_line("tar-write-open-failed path=%s errno=%d native=0x%08x",
+                 output_path, open_errno, fsdevGetLastResult());
+        return io_error();
+    }
     void *output_buffer = malloc(1024 * 1024);
     if (output_buffer &&
         setvbuf(output, output_buffer, _IOFBF, 1024 * 1024) != 0) {
@@ -382,7 +422,9 @@ Result tarWriteDirect(const char *output_path, TarArchive *archive,
         output_buffer = NULL;
     }
     Result result = 0;
-    if (ftruncate(fileno(output), (off_t)archive->size) != 0) result = io_error();
+    errno = 0;
+    if (ftruncate(fileno(output), (off_t)archive->size) != 0)
+        result = output_resize_error(output_path, archive->size);
     uint64_t offset = 0;
     while (R_SUCCEEDED(result) && offset < archive->size) {
         size_t wanted = archive->size - offset > buffer_size

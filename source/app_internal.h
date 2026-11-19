@@ -19,6 +19,7 @@
 #include "ftp.h"
 #include "mtp.h"
 #include "nup.h"
+#include "source_io.h"
 #include "status.h"
 #include "tar.h"
 #include "transport.h"
@@ -26,7 +27,7 @@
 #include "virtual_file.h"
 #include "virtual_tree.h"
 
-#define KAIDUMP_VERSION "1.0.0"
+#define KAIDUMP_VERSION "1.0.1"
 #define MAX_APPLICATIONS 512
 #define MAX_META_STATUS 64
 #define ROWS_PER_PAGE 10
@@ -141,6 +142,8 @@ typedef struct {
     bool log_active;
     bool kaihen_checked;
     bool kaihen_ready;
+    bool romfs_base_only;
+    bool romfs_self_matched;
 } AppState;
 
 extern AppState g;
@@ -157,6 +160,8 @@ size_t load_control_icon(void);
 void log_line(const char *format, ...);
 const char *result_name(Result result);
 void log_result(const char *operation, Result result);
+void format_result_code(char *out, size_t out_size, Result result);
+void log_process_identity(void);
 const char *kaihen_reason_name(KaihenCompatibilityReason reason);
 KaihenCompatibility check_kaihen_compatibility(void);
 void close_ns(void);

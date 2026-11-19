@@ -72,10 +72,12 @@ const char *result_name(Result result) {
         case 0x408: return "ProgramLocationNotFound";
         case 0xc08: return "RegisteredProgramLocationNotFound";
         case 0x1408: return "DebugProgramLocationNotFound";
+        case 0x7d202: return "PartitionNotFound";
         case 0x7d802: return "NcaExternalKeyNotFound";
         case 0x1fb402: return "RomNcaHeaderSignature1VerificationFailed";
         case 0x235e02: return "InvalidNcaId";
         case 0x244802: return "PartitionSignatureVerificationFailed";
+        case 0x2ee202: return "InvalidArgument";
         case 0x320002: return "PermissionDenied";
         case 0x339a02: return "ProgramInfoNotFound";
         default: return "UnknownResult";
@@ -86,6 +88,22 @@ void log_result(const char *operation, Result result) {
     log_line("%s: raw=0x%08x canonical=0x%06x module=%u description=%u name=%s",
              operation, result, R_VALUE(result), R_MODULE(result),
              R_DESCRIPTION(result), result_name(result));
+}
+
+void format_result_code(char *out, size_t out_size, Result result) {
+    snprintf(out, out_size, "%04u-%04u", 2000 + R_MODULE(result),
+             R_DESCRIPTION(result));
+}
+
+void log_process_identity(void) {
+    u64 program_id = 0;
+    u64 process_id = 0;
+    Result program_result = svcGetInfo(&program_id, InfoType_ProgramId,
+                                       CUR_PROCESS_HANDLE, 0);
+    Result process_result = svcGetProcessId(&process_id, CUR_PROCESS_HANDLE);
+    log_line("process-identity program=%016llX program-result=0x%08x pid=%llu pid-result=0x%08x",
+             (unsigned long long)program_id, program_result,
+             (unsigned long long)process_id, process_result);
 }
 
 const char *kaihen_reason_name(KaihenCompatibilityReason reason) {
@@ -131,6 +149,8 @@ KaihenCompatibility check_kaihen_compatibility(void) {
     check.status_result = henGetStatus(&hen, &status);
     serviceClose(&hen);
     if (R_FAILED(check.status_result)) goto finished;
+    log_line("hen-status pid=%llu protocol=%u",
+             (unsigned long long)status.process_id, status.protocol_version);
 
     check.protocol_version = status.protocol_version;
     check.initialization_result = status.initialization_result;

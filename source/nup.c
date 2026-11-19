@@ -1,4 +1,5 @@
 #include "nup.h"
+#include "source_io.h"
 
 #include <dirent.h>
 #include <errno.h>
@@ -625,6 +626,7 @@ static Result read_and_hash_file(PlanFile *file, const NupMount *view,
     if (!file->external) {
         input = fopen(file->path, "rb");
         if (!input) return io_error();
+        setvbuf(input, NULL, _IONBF, 0);
     } else if (!view->read_exefs) {
         return MAKERESULT(Module_Libnx, LibnxError_BadInput);
     }
@@ -642,7 +644,9 @@ static Result read_and_hash_file(PlanFile *file, const NupMount *view,
                 file->source_offset + file->size - remaining,
                 buffer, wanted, &got);
         } else {
-            got = fread(buffer, 1, wanted, input);
+            read_result = sourceReadExact(
+                input, file->path, file->size - remaining, buffer, wanted);
+            if (R_SUCCEEDED(read_result)) got = wanted;
         }
         if (R_FAILED(read_result) || got != wanted ||
             (output && fwrite(buffer, 1, got, output) != got)) {
@@ -1023,13 +1027,13 @@ static Result read_plan_file(NupArchive *archive, uint32_t index,
         if (archive->active_file) fclose(archive->active_file);
         archive->active_file = fopen(file->path, "rb");
         if (!archive->active_file) return io_error();
+        setvbuf(archive->active_file, NULL, _IONBF, 0);
         archive->active_file_index = index;
         archive->active_file_position = 0;
     }
-    if ((archive->active_file_position != offset &&
-         fseeko(archive->active_file, (off_t)offset, SEEK_SET) != 0) ||
-        fread(buffer, 1, size, archive->active_file) != size)
-        return io_error();
+    result = sourceReadExact(archive->active_file, file->path, offset,
+                             buffer, size);
+    if (R_FAILED(result)) return result;
     archive->active_file_position = offset + size;
     *bytes_read = size;
     return 0;

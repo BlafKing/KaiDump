@@ -27,6 +27,7 @@ int main(void) {
     log_line("HEN fsp-ldr override=%s handle=0x%x",
              fsldr_override != INVALID_HANDLE ? "present" : "absent",
              fsldr_override);
+    log_process_identity();
 
     Result ui_result = uiInitialize();
     log_result("ui-initialize", ui_result);

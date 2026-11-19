@@ -7,6 +7,8 @@
 
 #include "nup.h"
 
+#define TAR_ERROR_FAT32_LIMIT 201
+
 typedef struct TarArchive TarArchive;
 
 Result tarPrepare(TarArchive **out_archive, NupArchive *tree);
