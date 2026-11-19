@@ -34,6 +34,7 @@
 #define TITLE_CHARS 512
 #define COPY_BUFFER_SIZE (1024 * 1024)
 #define KAIDUMP_ERROR_CANCELED 200
+#define KAIDUMP_ERROR_FAT32_FILE_LIMIT 202
 #define KAIDUMP_MIN_HEN_PROTOCOL 7
 
 _Static_assert(sizeof(FsCodeInfo) == 0x1a4,

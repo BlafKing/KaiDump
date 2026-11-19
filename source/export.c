@@ -679,6 +679,11 @@ static Result serve_selected_tar_usb(PadState *pad) {
     return result;
 }
 
+static bool is_switch2_title(u64 application_id) {
+    return (application_id & 0xffff000000000000ULL) ==
+           0x0400000000000000ULL;
+}
+
 void dump_title(PadState *pad) {
     Application *app = &g.applications[g.selected];
     g.copied_bytes = 0;
@@ -820,15 +825,31 @@ void dump_title(PadState *pad) {
                R_DESCRIPTION(g.dump_result) == TAR_ERROR_FAT32_LIMIT) {
         snprintf(g.status, sizeof(g.status),
                  "The SD card is FAT32 and cannot store this TAR; use FTP, USB, or Extracted Files");
+    } else if (R_MODULE(g.dump_result) == Module_Libnx &&
+               R_DESCRIPTION(g.dump_result) ==
+                   KAIDUMP_ERROR_FAT32_FILE_LIMIT) {
+        snprintf(g.status, sizeof(g.status),
+                 "The SD card cannot store this file because it is larger than 4 GiB; use exFAT, FTP, or USB");
     } else {
         char code[16];
         format_result_code(code, sizeof(code), g.dump_result);
         if (R_VALUE(g.dump_result) == 0x7d802) {
-            snprintf(g.status, sizeof(g.status),
-                     g.romfs_self_matched
-                         ? "Update key unavailable (%s) even inside the game; see KaiDump.log"
-                         : "Update key unavailable (%s). Start hbmenu through this game, then retry",
-                     code);
+            if (is_switch2_title(app->record.application_id) &&
+                !g.romfs_self_matched) {
+                snprintf(g.status, sizeof(g.status),
+                         "Dump failed. Try launching kaiHEN through the game you are trying to dump, then open KaiDump and retry (%s)",
+                         code);
+                log_line("export-retry-hint title=%016llX reason=NcaExternalKeyNotFound switch2=1 self-match=0",
+                         (unsigned long long)app->record.application_id);
+            } else if (g.romfs_self_matched) {
+                snprintf(g.status, sizeof(g.status),
+                         "Update key unavailable (%s) even inside the game; see KaiDump.log",
+                         code);
+            } else {
+                snprintf(g.status, sizeof(g.status),
+                         "Update key unavailable (%s); see KaiDump.log",
+                         code);
+            }
         } else if (!g.copied_files && !g.copied_bytes) {
             snprintf(g.status, sizeof(g.status),
                      "Export failed (%s); nothing was written", code);

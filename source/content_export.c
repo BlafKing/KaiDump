@@ -78,9 +78,21 @@ static Result copy_tree(const char *source, const char *destination,
                          src, (unsigned long long)offset, wanted, result);
                 break;
             }
-            if (fwrite(g_copy_buffer, 1, wanted, out) != wanted) {
-                log_line("copy-write destination=%s errno=%d", dst, errno);
-                result = MAKERESULT(Module_Libnx, LibnxError_IoError);
+            size_t written = fwrite(g_copy_buffer, 1, wanted, out);
+            if (written != wanted) {
+                const int write_errno = errno;
+                const uint64_t position = offset + written;
+                const bool likely_fat32 =
+                    (uint64_t)st.st_size > UINT32_MAX &&
+                    position >= UINT32_MAX - COPY_BUFFER_SIZE;
+                log_line("copy-write destination=%s source-size=%llu offset=%llu wanted=%zu written=%zu errno=%d native=0x%08x fat32-limit=%u",
+                         dst, (unsigned long long)st.st_size,
+                         (unsigned long long)offset, wanted, written,
+                         write_errno, fsdevGetLastResult(), likely_fat32);
+                result = MAKERESULT(
+                    Module_Libnx,
+                    likely_fat32 ? KAIDUMP_ERROR_FAT32_FILE_LIMIT
+                                 : LibnxError_IoError);
                 break;
             }
             offset += wanted;
