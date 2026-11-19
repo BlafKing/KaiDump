@@ -552,6 +552,9 @@ static Result build_tree(NupArchive *archive) {
         }
         if (layout == NUP_LAYOUT_GAME)
             snprintf(prefix, sizeof(prefix), "game");
+        else if (layout == NUP_LAYOUT_GAME_PROGRAM)
+            snprintf(prefix, sizeof(prefix), "game/program%u",
+                     input->program_index);
         else if (layout == NUP_LAYOUT_BASE)
             snprintf(prefix, sizeof(prefix), "base");
         else if (layout == NUP_LAYOUT_UPDATE)

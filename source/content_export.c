@@ -323,11 +323,9 @@ Result export_selected_content(
     return result;
 }
 
-Result export_combined_game(u64 application_id, const char *root,
-                                   PadState *pad) {
-    char package[512];
+static Result export_combined_program(u64 application_id,
+                                      const char *package, PadState *pad) {
     char destination[576];
-    snprintf(package, sizeof(package), "%s/game", root);
 
     const NsApplicationContentMetaStatus *base =
         find_program_status(NcmContentMetaType_Application);
@@ -365,8 +363,34 @@ Result export_combined_game(u64 application_id, const char *root,
     }
 
     Result result = R_FAILED(exefs_result) ? exefs_result : romfs_result;
-    log_line("combined-game-finish id=%016llX exefs=0x%08x romfs=0x%08x result=0x%08x",
-             (unsigned long long)application_id,
+    log_line("combined-game-finish id=%016llX package=%s exefs=0x%08x romfs=0x%08x result=0x%08x",
+             (unsigned long long)application_id, package,
              exefs_result, romfs_result, result);
+    return result;
+}
+
+Result export_combined_game(u64 application_id, const char *root,
+                            PadState *pad) {
+    char package[512];
+    u8 programs[8] = {0};
+    s32 program_count = game_program_indices(programs, 8);
+    if (program_count <= 1) {
+        snprintf(package, sizeof(package), "%s/game", root);
+        return export_combined_program(application_id, package, pad);
+    }
+
+    /* Switch 2 Editions: the original game (program 0) goes in game/,
+       every other program in game/program<N>/. */
+    Result result = 0;
+    for (s32 i = 0; i < program_count && R_SUCCEEDED(result); ++i) {
+        if (programs[i])
+            snprintf(package, sizeof(package), "%s/game/program%u", root,
+                     programs[i]);
+        else
+            snprintf(package, sizeof(package), "%s/game", root);
+        set_program_index_override(programs[i]);
+        result = export_combined_program(application_id, package, pad);
+        set_program_index_override(-1);
+    }
     return result;
 }

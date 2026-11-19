@@ -269,9 +269,7 @@ static const char *content_choice_name(const ContentChoice *choice) {
     switch (choice->kind) {
         case CONTENT_GAME: return "Game";
         case CONTENT_BASE: return "Base game";
-        case CONTENT_DLC:
-            return g.meta[choice->meta_index].meta_type == NcmContentMetaType_DataPatch
-                ? "DLC update" : "DLC";
+        case CONTENT_DLC: return "DLC";
         default: return "Content";
     }
 }

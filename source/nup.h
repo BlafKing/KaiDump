@@ -19,6 +19,7 @@ enum {
     NUP_LAYOUT_BASE,
     NUP_LAYOUT_UPDATE,
     NUP_LAYOUT_DLC,
+    NUP_LAYOUT_GAME_PROGRAM,
 };
 
 typedef struct {
@@ -28,6 +29,7 @@ typedef struct {
     uint8_t kind;
     uint8_t flags;
     uint8_t layout;
+    uint8_t program_index;
 } NupInput;
 
 typedef struct {

@@ -147,6 +147,9 @@ static Result mount_nup_source(const NupInput *input, NupMount *mount,
     Result result = 0;
 
     if (choice->kind == CONTENT_GAME) {
+        set_program_index_override(
+            input->program_index == PROGRAM_INDEX_AUTO
+                ? -1 : input->program_index);
         result = mount_nup_combined_exefs(choice, context);
         if (R_SUCCEEDED(result)) {
             bool romfs_device = false;
@@ -160,6 +163,7 @@ static Result mount_nup_source(const NupInput *input, NupMount *mount,
                 snprintf(mount->romfs, sizeof(mount->romfs), "kdrom:/");
             }
         }
+        set_program_index_override(-1);
     } else {
         if (choice->kind == CONTENT_BASE) {
             result = mount_nup_exefs_status(
@@ -222,12 +226,35 @@ static size_t build_nup_inputs(NupInput *inputs, size_t capacity) {
         NupInput *input = &inputs[count];
         memset(input, 0, sizeof(*input));
         input->source_id = (u32)i;
+        input->program_index = PROGRAM_INDEX_AUTO;
         if (choice->kind == CONTENT_GAME) {
             input->title_id = app->record.application_id;
             input->version = choice->update_index >= 0
                 ? g.meta[choice->update_index].version : meta->version;
             input->kind = NUP_KIND_BASE;
             input->layout = NUP_LAYOUT_GAME;
+
+            /* Switch 2 Editions: the original game (program 0) goes in
+               game/, every other program in game/program<N>/. */
+            u8 programs[8] = {0};
+            s32 program_count = game_program_indices(programs, 8);
+            if (program_count > 1) {
+                const NupInput game = *input;
+                for (s32 p = 0; p < program_count && count < capacity; ++p) {
+                    if (programs[p] && g.output_format == OUTPUT_NUP) {
+                        /* The NUP format has no program index yet. */
+                        log_line("nup-input-skip-program index=%u",
+                                 programs[p]);
+                        continue;
+                    }
+                    inputs[count] = game;
+                    inputs[count].program_index = programs[p];
+                    inputs[count].layout = programs[p]
+                        ? NUP_LAYOUT_GAME_PROGRAM : NUP_LAYOUT_GAME;
+                    ++count;
+                }
+                continue;
+            }
         } else if (choice->kind == CONTENT_BASE) {
             input->title_id = meta->application_id;
             input->version = meta->version;
@@ -236,8 +263,7 @@ static size_t build_nup_inputs(NupInput *inputs, size_t capacity) {
         } else {
             input->title_id = meta->application_id;
             input->version = meta->version;
-            input->kind = meta->meta_type == NcmContentMetaType_DataPatch
-                ? NUP_KIND_ADDON_UPDATE : NUP_KIND_ADDON;
+            input->kind = NUP_KIND_ADDON;
             input->layout = NUP_LAYOUT_DLC;
         }
         ++count;
@@ -838,11 +864,11 @@ void dump_title(PadState *pad) {
                          (unsigned long long)app->record.application_id);
             } else if (g.romfs_self_matched) {
                 snprintf(g.status, sizeof(g.status),
-                         "Update key unavailable (%s) even inside the game; see KaiDump.log",
+                         "Content key unavailable (%s) even inside the game; see KaiDump.log",
                          code);
             } else {
                 snprintf(g.status, sizeof(g.status),
-                         "Update key unavailable (%s); see KaiDump.log",
+                         "Content key unavailable (%s); see KaiDump.log",
                          code);
             }
         } else if (!g.copied_files && !g.copied_bytes) {

@@ -426,9 +426,23 @@ static void build_content_choices(void) {
     }
 
     for (s32 i = 0; i < g.meta_count; ++i) {
-        if (g.meta[i].meta_type == NcmContentMetaType_AddOnContent ||
-            g.meta[i].meta_type == NcmContentMetaType_DataPatch)
-            add_content_choice(CONTENT_DLC, i, -1, false);
+        const NsApplicationContentMetaStatus *status = &g.meta[i];
+        if (status->meta_type == NcmContentMetaType_DataPatch) {
+            /* Like a game update, a DLC update only holds changes on top of
+               its DLC and cannot be read on its own. */
+            log_line("content-dlc-update-skipped id=%016llX version=%u storage=%u",
+                     (unsigned long long)status->application_id,
+                     status->version, status->storageID);
+            continue;
+        }
+        if (status->meta_type != NcmContentMetaType_AddOnContent) continue;
+        if (status->storageID == NcmStorageId_None) {
+            /* Listed by NS but not installed, and not on the inserted card. */
+            log_line("content-dlc-unavailable id=%016llX",
+                     (unsigned long long)status->application_id);
+            continue;
+        }
+        add_content_choice(CONTENT_DLC, i, -1, false);
     }
     log_line("content-choices count=%d base=%d update=%d game-card=%u",
              g.choice_count, base, update, game_card);
@@ -521,6 +535,46 @@ void load_grid_icons(void) {
     }
 }
 
+/* NS reports content on an inserted game card with no storage (base game,
+   and the DLC that Switch 2 Edition cards carry). Look each one up in the
+   card's own content meta database so it can be resolved and dumped. */
+static void resolve_game_card_meta(void) {
+    bool missing = false;
+    for (s32 i = 0; i < g.meta_count; ++i)
+        if (g.meta[i].storageID == NcmStorageId_None) missing = true;
+    if (!missing) return;
+
+    Result result = ncmInitialize();
+    log_result("details-game-card-ncm-initialize", result);
+    if (R_FAILED(result)) return;
+
+    NcmContentMetaDatabase database = {0};
+    result = ncmOpenContentMetaDatabase(&database, NcmStorageId_GameCard);
+    log_line("details-game-card-open result=0x%08x", result);
+    if (R_SUCCEEDED(result)) {
+        for (s32 i = 0; i < g.meta_count; ++i) {
+            NsApplicationContentMetaStatus *status = &g.meta[i];
+            if (status->storageID != NcmStorageId_None) continue;
+            NcmContentMetaKey key = {0};
+            Result key_result = ncmContentMetaDatabaseGetLatestContentMetaKey(
+                &database, &key, status->application_id);
+            const bool match = R_SUCCEEDED(key_result) &&
+                               key.type == status->meta_type;
+            log_line("details-game-card-meta id=%016llX type=%u result=0x%08x found-type=%u ns-version=%u card-version=%u match=%u",
+                     (unsigned long long)status->application_id,
+                     status->meta_type, key_result,
+                     R_SUCCEEDED(key_result) ? key.type : 0,
+                     status->version,
+                     R_SUCCEEDED(key_result) ? key.version : 0, match);
+            if (!match) continue;
+            status->storageID = NcmStorageId_GameCard;
+            status->version = key.version;
+        }
+        ncmContentMetaDatabaseClose(&database);
+    }
+    ncmExit();
+}
+
 void load_details(void) {
     if (g.count <= 0) return;
     Application *app = &g.applications[g.selected];
@@ -543,6 +597,7 @@ void load_details(void) {
             g.meta[i].version = app->base_version;
         }
     }
+    resolve_game_card_meta();
     Result current_control = load_control_from_content(app);
     log_line("details-current-control title=%016llX result=0x%08x version=%s icon=%zu",
              (unsigned long long)app->record.application_id,

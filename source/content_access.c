@@ -50,6 +50,17 @@ static Result get_content_attributes(NcmContentMetaDatabase *database,
     return MAKERESULT(Module_Libnx, LibnxError_NotFound);
 }
 
+/* Titles such as Switch 2 Editions carry more than one Program (the original
+   game at index 0 and a native program at a higher index). When set, every
+   Program lookup below selects exactly this index instead of the platform's
+   preferred one. -1 restores the automatic choice. */
+static int g_program_index_override = -1;
+
+void set_program_index_override(int program_index) {
+    g_program_index_override = program_index;
+    log_line("program-index-override index=%d", program_index);
+}
+
 static Result select_installed_content(
     NcmContentMetaDatabase *database, const NcmContentMetaKey *key,
     u8 content_type, NcmContentId *out_content_id, u8 *out_attributes,
@@ -57,6 +68,31 @@ static Result select_installed_content(
     *out_attributes = 0;
     *out_platform = 0xff;
     *out_id_offset = 0;
+
+    if (content_type == NcmContentType_Program &&
+        g_program_index_override >= 0) {
+        NcmContentInfo infos[32] = {0};
+        s32 written = 0;
+        Result list_result = ncmContentMetaDatabaseListContentInfo(
+            database, &written, infos, 32, key, 0);
+        if (R_SUCCEEDED(list_result)) {
+            list_result = MAKERESULT(Module_Libnx, LibnxError_NotFound);
+            for (s32 i = 0; i < written; ++i) {
+                if (infos[i].content_type != content_type ||
+                    infos[i].id_offset != g_program_index_override)
+                    continue;
+                *out_content_id = infos[i].content_id;
+                *out_attributes = infos[i].attr & 0x0f;
+                *out_id_offset = infos[i].id_offset;
+                list_result = 0;
+                break;
+            }
+        }
+        log_line("selected-content-variant id=%016llX forced-id-offset=%d attributes=%u result=0x%08x",
+                 (unsigned long long)key->id, g_program_index_override,
+                 *out_attributes, list_result);
+        return list_result;
+    }
 
     Result platform_result = ncmContentMetaDatabaseGetPlatform(
         database, out_platform, key);
@@ -826,6 +862,10 @@ Result mount_title_romfs(u64 application_id, bool *romfs_device) {
              (unsigned long long)application_id, native_result);
     if (R_SUCCEEDED(native_result)) return 0;
 
+    /* The remaining routes all open the application's first Program. */
+    if (g_program_index_override > 0)
+        return prefer_romfs_failure(native_result, self_result);
+
     *romfs_device = true;
     Result result = romfsMountDataStorageFromProgram(application_id, "kdrom");
     log_line("romfs-program title=%016llX result=0x%08x",
@@ -1017,6 +1057,54 @@ const NsApplicationContentMetaStatus *find_program_status(u8 meta_type) {
 
 static bool result_is_missing_external_key(Result result) {
     return (result & 0x3fffff) == 0x7d802;
+}
+
+static s32 list_program_indices(const NsApplicationContentMetaStatus *status,
+                                u8 *out, s32 capacity) {
+    if (!status || capacity <= 0) return 0;
+    Result result = ncmInitialize();
+    if (R_FAILED(result)) return 0;
+
+    s32 count = 0;
+    NcmContentMetaDatabase database = {0};
+    result = ncmOpenContentMetaDatabase(&database, status->storageID);
+    if (R_SUCCEEDED(result)) {
+        NcmContentMetaKey key = {
+            .id = status->application_id,
+            .version = status->version,
+            .type = status->meta_type,
+            .install_type = NcmContentInstallType_Full,
+        };
+        NcmContentInfo infos[32] = {0};
+        s32 written = 0;
+        result = ncmContentMetaDatabaseListContentInfo(
+            &database, &written, infos, 32, &key, 0);
+        for (s32 i = 0; R_SUCCEEDED(result) && i < written; ++i) {
+            if (infos[i].content_type != NcmContentType_Program) continue;
+            const u8 index = infos[i].id_offset;
+            s32 at = 0;
+            while (at < count && out[at] < index) ++at;
+            if (at < count && out[at] == index) continue;
+            if (count >= capacity) break;
+            memmove(&out[at + 1], &out[at], (size_t)(count - at));
+            out[at] = index;
+            ++count;
+        }
+        ncmContentMetaDatabaseClose(&database);
+    }
+    ncmExit();
+    log_line("program-indices id=%016llX type=%u result=0x%08x count=%d",
+             (unsigned long long)status->application_id, status->meta_type,
+             result, count);
+    return R_SUCCEEDED(result) ? count : 0;
+}
+
+s32 game_program_indices(u8 *out, s32 capacity) {
+    const NsApplicationContentMetaStatus *update =
+        find_program_status(NcmContentMetaType_Patch);
+    return list_program_indices(
+        update ? update : find_program_status(NcmContentMetaType_Application),
+        out, capacity);
 }
 
 typedef struct {
@@ -1288,24 +1376,46 @@ static Result open_self_filesystem_session(void) {
     return 0;
 }
 
-static Result open_self_data_storage(FsStorage *out) {
+static Result open_self_data_storage(FsStorage *out, bool current_program,
+                                     u8 program_index) {
     Result result = open_self_filesystem_session();
     if (R_FAILED(result)) return result;
 
-    result = serviceDispatch(&g_self_fs, 200,
-        .out_num_objects = 1,
-        .out_objects = &out->s,
-    );
-    log_result("romfs-self-open-current-process", result);
-    if (R_SUCCEEDED(result)) return 0;
+    if (current_program) {
+        result = serviceDispatch(&g_self_fs, 200,
+            .out_num_objects = 1,
+            .out_objects = &out->s,
+        );
+        log_result("romfs-self-open-current-process", result);
+        if (R_SUCCEEDED(result)) return 0;
+    }
 
-    const u8 program_index = 0;
     Result index_result = serviceDispatchIn(&g_self_fs, 205, program_index,
         .out_num_objects = 1,
         .out_objects = &out->s,
     );
-    log_result("romfs-self-open-program-index", index_result);
-    return R_SUCCEEDED(index_result) ? 0 : result;
+    log_line("romfs-self-open-program-index index=%u result=0x%08x",
+             program_index, index_result);
+    return R_SUCCEEDED(index_result) || !current_program ? index_result
+                                                         : result;
+}
+
+/* Runtime program id of the Program at a given index (or the automatic
+   choice for -1). */
+static u64 program_runtime_id(const NsApplicationContentMetaStatus *status,
+                              int program_index, u8 *out_index) {
+    const int previous = g_program_index_override;
+    g_program_index_override = program_index;
+    char path[FS_MAX_PATH] = {0};
+    FsContentAttributes attributes = 0;
+    u64 runtime_program_id = 0;
+    u8 resolved_index = 0;
+    Result result = resolve_installed_content_info(
+        status, NcmContentType_Program, path, sizeof(path), &attributes,
+        &runtime_program_id, &resolved_index);
+    g_program_index_override = previous;
+    if (out_index) *out_index = resolved_index;
+    return R_SUCCEEDED(result) ? runtime_program_id : 0;
 }
 
 static Result mount_self_title_romfs(u64 application_id,
@@ -1318,36 +1428,46 @@ static Result mount_self_title_romfs(u64 application_id,
                                   CUR_PROCESS_HANDLE, 0);
     if (R_FAILED(id_result)) process_program_id = 0;
 
-    u64 runtime_program_id = 0;
-    bool matches = process_program_id && process_program_id == application_id;
-    if (process_program_id && !matches) {
-        const NsApplicationContentMetaStatus *base =
-            find_program_status(NcmContentMetaType_Application);
-        const NsApplicationContentMetaStatus *update =
-            find_program_status(NcmContentMetaType_Patch);
-        const NsApplicationContentMetaStatus *selected = update ? update : base;
-        if (selected) {
-            char path[FS_MAX_PATH] = {0};
-            FsContentAttributes attributes = 0;
-            u8 program_index = 0;
-            Result resolve_result = resolve_installed_content_info(
-                selected, NcmContentType_Program, path, sizeof(path),
-                &attributes, &runtime_program_id, &program_index);
-            if (R_FAILED(resolve_result)) runtime_program_id = 0;
-            matches = runtime_program_id &&
-                      process_program_id == runtime_program_id;
+    const NsApplicationContentMetaStatus *base =
+        find_program_status(NcmContentMetaType_Application);
+    const NsApplicationContentMetaStatus *update =
+        find_program_status(NcmContentMetaType_Patch);
+    const NsApplicationContentMetaStatus *selected = update ? update : base;
+
+    /* The Program this export wants, and the one KaiDump is running as. */
+    u8 wanted_index = 0;
+    u64 wanted_runtime = selected
+        ? program_runtime_id(selected, g_program_index_override,
+                             &wanted_index)
+        : 0;
+    bool matches = false;
+    u8 own_index = 0;
+    if (process_program_id && process_program_id == wanted_runtime) {
+        matches = true;
+        own_index = wanted_index;
+    } else if (process_program_id && selected) {
+        u8 indices[8] = {0};
+        s32 count = list_program_indices(selected, indices, 8);
+        for (s32 i = 0; i < count && !matches; ++i) {
+            if (program_runtime_id(selected, indices[i], NULL) !=
+                process_program_id)
+                continue;
+            matches = true;
+            own_index = indices[i];
         }
     }
 
-    log_line("romfs-self-check process=%016llX id-result=0x%08x application=%016llX runtime=%016llX match=%u",
+    log_line("romfs-self-check process=%016llX id-result=0x%08x application=%016llX runtime=%016llX wanted-index=%u own-index=%u match=%u",
              (unsigned long long)process_program_id, id_result,
              (unsigned long long)application_id,
-             (unsigned long long)runtime_program_id, matches);
+             (unsigned long long)wanted_runtime, wanted_index, own_index,
+             matches);
     if (!matches) return MAKERESULT(Module_Libnx, LibnxError_NotFound);
     g.romfs_self_matched = true;
 
     FsStorage storage = {0};
-    Result result = open_self_data_storage(&storage);
+    Result result = open_self_data_storage(
+        &storage, wanted_index == own_index, wanted_index);
     if (R_SUCCEEDED(result)) {
         s64 size = 0;
         Result size_result = fsStorageGetSize(&storage, &size);
@@ -1503,132 +1623,33 @@ static Result end_temporary_program_location(
     return result;
 }
 
-/* Update ExeFS ------------------------------------------------------------
- * An update's Program content usually keeps the application's program id.
- * fsp-ldr resolves that id through the base storage's LocationResolver, which
- * returns the *base* Program unless NS has redirected it (NS only does that
- * when the game is launched). Without a redirect the "update" ExeFS is the
- * base ExeFS. Mirror NS for the duration of the open with a program
- * redirection on that resolver, and remove it afterwards. */
-typedef struct {
-    LrLocationResolver resolver;
-    u64 program_id;
-    bool lr_initialized;
-    bool resolver_open;
-    bool redirected;
-} TemporaryPatchRedirection;
-
-static Result write_program_redirection(Service *resolver, u64 program_id,
-                                        const char *path, u8 attributes) {
-    struct {
-        u64 program_id;
-        u8 attributes[16];
-    } input = {
-        .program_id = program_id,
-        .attributes = {attributes},
-    };
-    char send_path[FS_MAX_PATH] = {0};
-    size_t path_length = strnlen(path, sizeof(send_path));
-    if (path_length >= sizeof(send_path))
-        return MAKERESULT(Module_Libnx, LibnxError_BadInput);
-    memcpy(send_path, path, path_length + 1);
-    return serviceDispatchIn(resolver, 1, input,
-        .buffer_attrs = {SfBufferAttr_HipcPointer | SfBufferAttr_In},
-        .buffers = {{send_path, sizeof(send_path)}},
-    );
-}
-
-static Result end_temporary_patch_redirection(
-    TemporaryPatchRedirection *redirection) {
-    Result result = 0;
-    if (redirection->redirected && redirection->resolver_open) {
-        result = serviceDispatchIn(
-            &redirection->resolver.s, 12, redirection->program_id);
-        char path[FS_MAX_PATH] = {0};
-        u8 attributes[16] = {0};
-        Result verify = resolve_location_path(
-            &redirection->resolver.s, 0, redirection->program_id, path,
-            attributes);
-        log_line("exefs-patch-redirect-erase program=%016llX result=0x%08x resolved=0x%08x path=%s",
-                 (unsigned long long)redirection->program_id, result, verify,
-                 R_SUCCEEDED(verify) ? path : "(unavailable)");
+/* Registered program locations ---------------------------------------------
+ * fsp-ldr resolves a program through the RegisteredLocationResolver before
+ * the storage's own resolver. NS registers the running game's program there
+ * (pointing at its update), and an update's Program keeps the application's
+ * program id, so without a registration of our own the wrong NCA is opened:
+ *  - an update's ExeFS would come from the base game, and
+ *  - while launched through the game, the base ExeFS would come from the
+ *    update (with the base's attributes, failing 2002-4058).
+ * Register the selected NCA for the duration of the open and restore the
+ * previous registration afterwards. */
+static bool registered_location_conflicts(u64 program_id, const char *path) {
+    if (R_FAILED(lrInitialize())) return false;
+    bool conflict = false;
+    LrRegisteredLocationResolver resolver = {0};
+    if (R_SUCCEEDED(lrOpenRegisteredLocationResolver(&resolver))) {
+        char current[FS_MAX_PATH] = {0};
+        u8 current_attributes[16] = {0};
+        Result result = resolve_location_path(
+            &resolver.s, 0, program_id, current, current_attributes);
+        conflict = R_SUCCEEDED(result) && strcmp(current, path);
+        log_line("exefs-registered-location program=%016llX result=0x%08x conflict=%u path=%s",
+                 (unsigned long long)program_id, result, conflict,
+                 R_SUCCEEDED(result) ? current : "(none)");
+        serviceClose(&resolver.s);
     }
-    if (redirection->resolver_open) serviceClose(&redirection->resolver.s);
-    if (redirection->lr_initialized) lrExit();
-    memset(redirection, 0, sizeof(*redirection));
-    return result;
-}
-
-static Result begin_temporary_patch_redirection(
-    TemporaryPatchRedirection *redirection, u8 storage_id, u64 program_id,
-    const char *patch_path, u8 patch_attributes, const char *base_path) {
-    memset(redirection, 0, sizeof(*redirection));
-    redirection->program_id = program_id;
-
-    Result result = lrInitialize();
-    log_result("exefs-patch-redirect-lr-initialize", result);
-    if (R_FAILED(result)) return result;
-    redirection->lr_initialized = true;
-
-    result = lrOpenLocationResolver(
-        (NcmStorageId)storage_id, &redirection->resolver);
-    log_line("exefs-patch-redirect-open storage=%u result=0x%08x",
-             storage_id, result);
-    if (R_FAILED(result)) goto fail;
-    redirection->resolver_open = true;
-
-    char current[FS_MAX_PATH] = {0};
-    u8 current_attributes[16] = {0};
-    Result current_result = resolve_location_path(
-        &redirection->resolver.s, 0, program_id, current,
-        current_attributes);
-    log_line("exefs-patch-redirect-current program=%016llX result=0x%08x path=%s",
-             (unsigned long long)program_id, current_result,
-             R_SUCCEEDED(current_result) ? current : "(unavailable)");
-    if (R_SUCCEEDED(current_result)) {
-        if (!strcmp(current, patch_path)) {
-            /* NS already points the program at this update (the game is
-               running), so nothing needs to change. */
-            log_line("exefs-patch-redirect-skip reason=already-redirected");
-            end_temporary_patch_redirection(redirection);
-            return 0;
-        }
-        if (base_path && base_path[0] && strcmp(current, base_path)) {
-            /* Something other than the installed base is redirected here.
-               Do not overwrite or erase a redirection we did not create. */
-            result = MAKERESULT(Module_Libnx, LibnxError_BadInput);
-            log_line("exefs-patch-redirect-skip reason=foreign-redirection base=%s",
-                     base_path);
-            goto fail;
-        }
-    } else if (!result_is_missing_program_location(current_result)) {
-        result = current_result;
-        goto fail;
-    }
-
-    result = write_program_redirection(
-        &redirection->resolver.s, program_id, patch_path, patch_attributes);
-    log_line("exefs-patch-redirect-write program=%016llX attributes=%u result=0x%08x path=%s",
-             (unsigned long long)program_id, patch_attributes, result,
-             patch_path);
-    if (R_FAILED(result)) goto fail;
-    redirection->redirected = true;
-
-    char verified[FS_MAX_PATH] = {0};
-    u8 verified_attributes[16] = {0};
-    result = resolve_location_path(
-        &redirection->resolver.s, 0, program_id, verified,
-        verified_attributes);
-    log_line("exefs-patch-redirect-verify program=%016llX attributes=%u result=0x%08x path=%s",
-             (unsigned long long)program_id, verified_attributes[0], result,
-             R_SUCCEEDED(result) ? verified : "(unavailable)");
-    if (R_SUCCEEDED(result) && strcmp(verified, patch_path))
-        result = MAKERESULT(Module_Libnx, LibnxError_BadInput);
-    if (R_SUCCEEDED(result)) return 0;
-
-fail:
-    end_temporary_patch_redirection(redirection);
-    return result;
+    lrExit();
+    return conflict;
 }
 
 Result open_title_exefs(
@@ -1697,27 +1718,23 @@ Result open_title_exefs(
 
     u8 storage_id = (u8)(original ? original->storageID : selected->storageID);
 
-    TemporaryPatchRedirection patch_redirection = {0};
-    if (!location_active && original &&
-        selected->meta_type == NcmContentMetaType_Patch) {
-        char base_path[FS_MAX_PATH] = {0};
-        FsContentAttributes base_attributes = 0;
-        Result base_result = resolve_installed_content_info(
-            original, NcmContentType_Program, base_path, sizeof(base_path),
-            &base_attributes, NULL, NULL);
-        if (R_FAILED(base_result)) base_path[0] = 0;
-        result = begin_temporary_patch_redirection(
-            &patch_redirection, storage_id, runtime_program_id, path,
-            (u8)attributes, base_path);
+    TemporaryProgramLocation code_location = {0};
+    bool code_location_active = false;
+    if (!location_active &&
+        ((original && selected->meta_type == NcmContentMetaType_Patch) ||
+         registered_location_conflicts(runtime_program_id, path))) {
+        result = begin_temporary_program_location(
+            &code_location, runtime_program_id, program_id, path,
+            (u8)attributes);
         if (R_FAILED(result)) {
-            /* Opening without the redirection would return the base ExeFS
-               under the update's name, so fail instead. */
-            log_line("exefs-diagnostic-attempt-finish attempt=%llu stage=patch-redirect result=0x%08x elapsed-us=%llu",
+            /* Opening without it would return another NCA's ExeFS. */
+            log_line("exefs-diagnostic-attempt-finish attempt=%llu stage=code-location result=0x%08x elapsed-us=%llu",
                      (unsigned long long)attempt, result,
                      (unsigned long long)(armTicksToNs(
                          armGetSystemTick() - started) / 1000));
             return result;
         }
+        code_location_active = true;
     }
 
     result = open_code_filesystem(
@@ -1763,10 +1780,11 @@ Result open_title_exefs(
                  (unsigned long long)runtime_program_id, result);
     }
     if (R_SUCCEEDED(result)) log_exefs_root(out, attempt);
-    Result redirect_cleanup = end_temporary_patch_redirection(
-        &patch_redirection);
-    if (R_FAILED(redirect_cleanup))
-        log_result("exefs-patch-redirect-cleanup", redirect_cleanup);
+    if (code_location_active) {
+        Result code_cleanup = end_temporary_program_location(&code_location);
+        if (R_FAILED(code_cleanup))
+            log_result("exefs-code-location-cleanup", code_cleanup);
+    }
     if (location_active) {
         Result map_cleanup_result = end_temporary_program_index_map(&index_map);
         if (R_FAILED(map_cleanup_result))

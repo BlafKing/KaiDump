@@ -27,7 +27,7 @@
 #include "virtual_file.h"
 #include "virtual_tree.h"
 
-#define KAIDUMP_VERSION "1.0.3"
+#define KAIDUMP_VERSION "1.0.4"
 #define MAX_APPLICATIONS 512
 #define MAX_META_STATUS 64
 #define ROWS_PER_PAGE 10
@@ -214,6 +214,10 @@ Result mount_title_romfs(u64 application_id, bool *romfs_device);
 Result prefer_romfs_failure(Result kept, Result candidate);
 void unmount_title_romfs(const char *name, bool romfs_device);
 const NsApplicationContentMetaStatus *find_program_status(u8 meta_type);
+/* Programs of titles with more than one (Switch 2 Editions). */
+#define PROGRAM_INDEX_AUTO 0xff
+void set_program_index_override(int program_index);
+s32 game_program_indices(u8 *out, s32 capacity);
 Result export_selected_content(const NsApplicationContentMetaStatus *status,
                                const char *root, PadState *pad);
 Result export_combined_game(u64 application_id, const char *root,
