@@ -311,9 +311,12 @@ static Result discover_accessible_applications(void) {
                 bool duplicate = false;
                 for (s32 existing = 0; existing < g.count; ++existing) {
                     if (g.applications[existing].record.application_id == keys[i].id) {
-                        if (storages[storage_index] == NcmStorageId_GameCard)
+                        if (storages[storage_index] == NcmStorageId_GameCard) {
                             g.applications[existing].base_storage =
                                 NcmStorageId_GameCard;
+                            g.applications[existing].base_version =
+                                keys[i].version;
+                        }
                         duplicate = true;
                         break;
                     }
@@ -322,6 +325,7 @@ static Result discover_accessible_applications(void) {
                 Application *app = &g.applications[g.count++];
                 app->record.application_id = keys[i].id;
                 app->base_storage = storages[storage_index];
+                app->base_version = keys[i].version;
                 log_line("inventory-add title=%016llX storage=%u version=%u",
                          (unsigned long long)keys[i].id,
                          storages[storage_index], keys[i].version);
@@ -403,8 +407,18 @@ static void build_content_choices(void) {
                      g.applications[g.selected].base_storage ==
                          NcmStorageId_GameCard;
     if (game_card) {
-        add_content_choice(CONTENT_BASE, base, -1, true);
-        if (update >= 0) add_content_choice(CONTENT_UPDATE, update, -1, true);
+        /* An update's RomFS is a delta on top of the base RomFS, so it can
+           only be read merged with the base. Offer the merged game, plus the
+           untouched game card as an option. A card can also ship with a
+           revision at or above the installed update; the console ignores
+           such an update, so only the card is offered then. */
+        const bool update_newer = update >= 0 &&
+            g.meta[update].version > g.meta[base].version;
+        if (update >= 0 && !update_newer)
+            log_line("content-update-superseded update=%u base=%u",
+                     g.meta[update].version, g.meta[base].version);
+        if (update_newer) add_content_choice(CONTENT_GAME, base, update, true);
+        add_content_choice(CONTENT_BASE, base, -1, !update_newer);
     } else if (base >= 0) {
         add_content_choice(CONTENT_GAME, base, update, true);
     } else if (update >= 0) {
@@ -519,10 +533,14 @@ void load_details(void) {
     for (s32 i = 0; i < g.meta_count; ++i) {
         if (g.meta[i].meta_type == NcmContentMetaType_Application &&
             g.meta[i].storageID == NcmStorageId_None && app->base_storage) {
-            log_line("details-base-storage title=%016llX ns=%u inventory=%u",
+            log_line("details-base-storage title=%016llX ns=%u inventory=%u ns-version=%u inventory-version=%u",
                      (unsigned long long)app->record.application_id,
-                     g.meta[i].storageID, app->base_storage);
+                     g.meta[i].storageID, app->base_storage,
+                     g.meta[i].version, app->base_version);
             g.meta[i].storageID = app->base_storage;
+            /* NS does not know where this base lives, so its version may be
+               stale too; NCM lookups need the version actually on storage. */
+            g.meta[i].version = app->base_version;
         }
     }
     Result current_control = load_control_from_content(app);

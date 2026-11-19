@@ -60,8 +60,18 @@ static Result mount_nup_combined_exefs(
         ? choice->update_index : choice->meta_index;
     const NsApplicationContentMetaStatus *original =
         index != choice->meta_index ? &g.meta[choice->meta_index] : NULL;
-    return mount_nup_exefs_status(
+    Result result = mount_nup_exefs_status(
         &g.meta[index], original, app->record.application_id, context);
+    if (R_FAILED(result) && original &&
+        !(R_MODULE(result) == Module_Libnx &&
+          R_DESCRIPTION(result) == LibnxError_TooManyDevOpTabs)) {
+        log_line("exefs-warning base-only: the update ExeFS could not be opened (0x%08x); using the base ExeFS",
+                 result);
+        result = mount_nup_exefs_status(
+            original, NULL, app->record.application_id, context);
+        if (R_SUCCEEDED(result)) g.exefs_base_only = true;
+    }
+    return result;
 }
 
 static Result mount_nup_romfs_status(
@@ -105,15 +115,11 @@ static Result mount_nup_romfs_status(
         result = mount_result;
     }
 
+    const Result storage_failure = result;
     FsFileSystem filesystem = {0};
-    if (status->meta_type == NcmContentMetaType_Patch) {
-        result = fsOpenFileSystemWithPatch(
-            &filesystem, status->application_id, (FsFileSystemType)1);
-    } else {
-        result = fsOpenFileSystemWithId(
-            &filesystem, status->application_id,
-            (FsFileSystemType)proxy_type, path, attributes);
-    }
+    result = fsOpenFileSystemWithId(
+        &filesystem, status->application_id,
+        (FsFileSystemType)proxy_type, path, attributes);
     log_line("nup-romfs-open-filesystem id=%016llX type=%u result=0x%08x",
              (unsigned long long)status->application_id,
              status->meta_type, result);
@@ -127,7 +133,7 @@ static Result mount_nup_romfs_status(
         }
         result = MAKERESULT(Module_Libnx, LibnxError_TooManyDevOpTabs);
     }
-    return result;
+    return prefer_romfs_failure(storage_failure, result);
 }
 
 static Result mount_nup_source(const NupInput *input, NupMount *mount,
@@ -155,18 +161,9 @@ static Result mount_nup_source(const NupInput *input, NupMount *mount,
             }
         }
     } else {
-        if (choice->kind == CONTENT_BASE || choice->kind == CONTENT_UPDATE) {
-            const NsApplicationContentMetaStatus *original = NULL;
-            if (choice->kind == CONTENT_UPDATE) {
-                for (s32 i = 0; i < g.meta_count; ++i) {
-                    if (g.meta[i].meta_type == NcmContentMetaType_Application) {
-                        original = &g.meta[i];
-                        break;
-                    }
-                }
-            }
+        if (choice->kind == CONTENT_BASE) {
             result = mount_nup_exefs_status(
-                status, original,
+                status, NULL,
                 g.applications[g.selected].record.application_id, context);
         }
         if (R_SUCCEEDED(result))
@@ -218,7 +215,6 @@ static void ftp_status(void *user, const char *status, uint64_t transferred) {
 static size_t build_nup_inputs(NupInput *inputs, size_t capacity) {
     Application *app = &g.applications[g.selected];
     size_t count = 0;
-    bool has_base = false;
     for (s32 i = 0; i < g.choice_count && count < capacity; ++i) {
         ContentChoice *choice = &g.choices[i];
         if (!choice->selected) continue;
@@ -232,18 +228,11 @@ static size_t build_nup_inputs(NupInput *inputs, size_t capacity) {
                 ? g.meta[choice->update_index].version : meta->version;
             input->kind = NUP_KIND_BASE;
             input->layout = NUP_LAYOUT_GAME;
-            has_base = true;
         } else if (choice->kind == CONTENT_BASE) {
             input->title_id = meta->application_id;
             input->version = meta->version;
             input->kind = NUP_KIND_BASE;
             input->layout = NUP_LAYOUT_BASE;
-            has_base = true;
-        } else if (choice->kind == CONTENT_UPDATE) {
-            input->title_id = meta->application_id;
-            input->version = meta->version;
-            input->kind = NUP_KIND_UPDATE;
-            input->layout = NUP_LAYOUT_UPDATE;
         } else {
             input->title_id = meta->application_id;
             input->version = meta->version;
@@ -252,10 +241,6 @@ static size_t build_nup_inputs(NupInput *inputs, size_t capacity) {
             input->layout = NUP_LAYOUT_DLC;
         }
         ++count;
-    }
-    if (!has_base) {
-        for (size_t i = 0; i < count; ++i)
-            if (inputs[i].kind == NUP_KIND_UPDATE) inputs[i].flags |= 1;
     }
     return count;
 }
@@ -692,6 +677,7 @@ void dump_title(PadState *pad) {
     g.status[0] = 0;
     g.screen = SCREEN_RESULT;
     g.romfs_base_only = false;
+    g.exefs_base_only = false;
     g.romfs_self_matched = false;
 
     log_line("export-start title=%016llX name=%s mode=%s destination=%s choices=%d selected=%d",
@@ -809,9 +795,18 @@ void dump_title(PadState *pad) {
                              ? "%d selected content package%s archived as TAR"
                              : "%d selected content package%s exported successfully",
                      completed, completed == 1 ? "" : "s");
-        if (g.romfs_base_only)
+        if (g.romfs_base_only && g.exefs_base_only)
+            snprintf(g.status, sizeof(g.status),
+                     is_switch2_title(app->record.application_id) &&
+                             !g.romfs_self_matched
+                         ? "Update unavailable, so the base version was exported. Launch kaiHEN through this game to include it"
+                         : "Warning: the update could not be opened, so the base version was exported (see KaiDump.log)");
+        else if (g.romfs_base_only)
             snprintf(g.status, sizeof(g.status),
                      "Warning: the update's RomFS was unavailable, so the base version was used (see KaiDump.log)");
+        else if (g.exefs_base_only)
+            snprintf(g.status, sizeof(g.status),
+                     "Warning: the update's ExeFS was unavailable, so the base ExeFS was used (see KaiDump.log)");
     } else if (R_MODULE(g.dump_result) == Module_Libnx &&
                R_DESCRIPTION(g.dump_result) == KAIDUMP_ERROR_CANCELED) {
         snprintf(g.status, sizeof(g.status),

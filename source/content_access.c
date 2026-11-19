@@ -370,26 +370,33 @@ static bool license_needs_export_context(Result result) {
     return canonical == 0x1491 || canonical == 0x691;
 }
 
-static Result prepare_export_rights_context(Service *es,
-                                            const FsRightsId *rights_id) {
+/* ES treats the first eight rights-id bytes as a big-endian title id. For
+   an update or DLC that is the update/DLC id, not the owning application. */
+static u64 rights_title_id(const FsRightsId *rights_id) {
+    const u8 *rights = (const u8 *)rights_id;
+    u64 title_id = 0;
+    for (size_t i = 0; i < 8; ++i) title_id = (title_id << 8) | rights[i];
+    return title_id;
+}
+
+static Result prepare_export_rights_context(Service *context, Service *es,
+                                            u64 title_id) {
     Result result = 0;
-    if (!serviceIsActive(&g_license_context)) {
+    if (!serviceIsActive(context)) {
         result = serviceDispatch(es, 2001,
             .out_num_objects = 1,
-            .out_objects = &g_license_context,
+            .out_objects = context,
         );
         log_result("license-context-create", result);
         if (R_FAILED(result)) return result;
     }
 
-    /* ES treats the first eight rights-id bytes as a big-endian title id,
-       while the export context accepts that integer in little-endian form. */
+    /* The export context accepts the title id in little-endian form. */
     u8 rights_application[8] = {0};
-    const u8 *rights = (const u8 *)rights_id;
     for (size_t i = 0; i < sizeof(rights_application); ++i)
-        rights_application[i] = rights[sizeof(rights_application) - 1 - i];
+        rights_application[i] = (u8)(title_id >> (8 * i));
 
-    result = serviceDispatch(&g_license_context, 2,
+    result = serviceDispatch(context, 2,
         .buffer_attrs = { SfBufferAttr_HipcMapAlias | SfBufferAttr_In },
         .buffers = { { rights_application, sizeof(rights_application) } },
     );
@@ -398,7 +405,7 @@ static Result prepare_export_rights_context(Service *es,
 
     const u8 request_all_accounts = 1;
     u64 empty_account = 0;
-    result = serviceDispatchIn(&g_license_context, 17, request_all_accounts,
+    result = serviceDispatchIn(context, 17, request_all_accounts,
         .buffer_attrs = {
             SfBufferAttr_HipcMapAlias | SfBufferAttr_In,
             SfBufferAttr_HipcMapAlias | SfBufferAttr_In,
@@ -411,7 +418,7 @@ static Result prepare_export_rights_context(Service *es,
     log_result("license-context-request-accounts", result);
     if (R_FAILED(result)) return result;
 
-    result = serviceDispatch(&g_license_context, 3);
+    result = serviceDispatch(context, 3);
     log_result("license-context-evaluate", result);
     return result;
 }
@@ -437,20 +444,45 @@ static Result prepare_installed_license(NcmContentStorage *storage,
         result = dispatch_license_prepare(&es, &rights.rights_id, generation);
         log_result("license-prepare-initial", result);
         if (license_needs_export_context(result)) {
-            Result context_result = prepare_export_rights_context(
-                &es, &rights.rights_id);
-            if (R_SUCCEEDED(context_result)) {
+            /* First select the title named by the rights id (correct for
+               digital base games). For updates and DLC that is not the
+               owning application, so retry once with the application id in
+               a separate context, leaving the first context untouched. */
+            const u64 rights_title = rights_title_id(&rights.rights_id);
+            const u64 application_id = g.count > 0
+                ? g.applications[g.selected].record.application_id : 0;
+            struct {
+                Service *context;
+                u64 title_id;
+                const char *kind;
+            } attempts[] = {
+                { &g_license_context, rights_title, "rights-title" },
+                { &g_license_application_context, application_id,
+                  "application" },
+            };
+            const size_t attempt_count =
+                application_id && application_id != rights_title ? 2 : 1;
+            for (size_t i = 0; i < attempt_count; ++i) {
+                log_line("license-context-attempt kind=%s title=%016llX",
+                         attempts[i].kind,
+                         (unsigned long long)attempts[i].title_id);
+                Result context_result = prepare_export_rights_context(
+                    attempts[i].context, &es, attempts[i].title_id);
+                if (R_FAILED(context_result)) {
+                    result = context_result;
+                    continue;
+                }
                 result = dispatch_license_prepare(
                     &es, &rights.rights_id, generation);
                 log_result("license-prepare-after-context", result);
                 if (R_SUCCEEDED(result)) {
                     Result activate_result = serviceDispatch(
-                        &g_license_context, 102);
+                        attempts[i].context, 102);
                     log_result("license-context-activate", activate_result);
                     if (R_FAILED(activate_result)) result = activate_result;
+                    break;
                 }
-            } else {
-                result = context_result;
+                if (!license_needs_export_context(result)) break;
             }
         }
         serviceClose(&es);
@@ -635,7 +667,7 @@ static int romfs_failure_rank(Result result) {
     return 1;
 }
 
-static Result prefer_romfs_failure(Result kept, Result candidate) {
+Result prefer_romfs_failure(Result kept, Result candidate) {
     return romfs_failure_rank(candidate) > romfs_failure_rank(kept)
         ? candidate : kept;
 }
@@ -949,7 +981,7 @@ static Result resolve_installed_content_impl(
     *attributes = (FsContentAttributes)content_attributes;
     if (runtime_program_index)
         *runtime_program_index = content_id_offset;
-    log_line("selected-content-resolve id=%016llX meta-type=%u content-type=%u storage=%u version=%u platform=%u id-offset=%u attributes=%u license=%u result=0x%08x path=%s",
+    log_line("selected-content-resolve id=%016llX meta-type=%u content-type=%u storage=%u version=%u platform=%u id-offset=%u attributes=%u prepare-license=%u result=0x%08x path=%s",
              (unsigned long long)status->application_id, status->meta_type,
              content_type, status->storageID, status->version,
              content_platform, content_id_offset, content_attributes,
@@ -1471,6 +1503,134 @@ static Result end_temporary_program_location(
     return result;
 }
 
+/* Update ExeFS ------------------------------------------------------------
+ * An update's Program content usually keeps the application's program id.
+ * fsp-ldr resolves that id through the base storage's LocationResolver, which
+ * returns the *base* Program unless NS has redirected it (NS only does that
+ * when the game is launched). Without a redirect the "update" ExeFS is the
+ * base ExeFS. Mirror NS for the duration of the open with a program
+ * redirection on that resolver, and remove it afterwards. */
+typedef struct {
+    LrLocationResolver resolver;
+    u64 program_id;
+    bool lr_initialized;
+    bool resolver_open;
+    bool redirected;
+} TemporaryPatchRedirection;
+
+static Result write_program_redirection(Service *resolver, u64 program_id,
+                                        const char *path, u8 attributes) {
+    struct {
+        u64 program_id;
+        u8 attributes[16];
+    } input = {
+        .program_id = program_id,
+        .attributes = {attributes},
+    };
+    char send_path[FS_MAX_PATH] = {0};
+    size_t path_length = strnlen(path, sizeof(send_path));
+    if (path_length >= sizeof(send_path))
+        return MAKERESULT(Module_Libnx, LibnxError_BadInput);
+    memcpy(send_path, path, path_length + 1);
+    return serviceDispatchIn(resolver, 1, input,
+        .buffer_attrs = {SfBufferAttr_HipcPointer | SfBufferAttr_In},
+        .buffers = {{send_path, sizeof(send_path)}},
+    );
+}
+
+static Result end_temporary_patch_redirection(
+    TemporaryPatchRedirection *redirection) {
+    Result result = 0;
+    if (redirection->redirected && redirection->resolver_open) {
+        result = serviceDispatchIn(
+            &redirection->resolver.s, 12, redirection->program_id);
+        char path[FS_MAX_PATH] = {0};
+        u8 attributes[16] = {0};
+        Result verify = resolve_location_path(
+            &redirection->resolver.s, 0, redirection->program_id, path,
+            attributes);
+        log_line("exefs-patch-redirect-erase program=%016llX result=0x%08x resolved=0x%08x path=%s",
+                 (unsigned long long)redirection->program_id, result, verify,
+                 R_SUCCEEDED(verify) ? path : "(unavailable)");
+    }
+    if (redirection->resolver_open) serviceClose(&redirection->resolver.s);
+    if (redirection->lr_initialized) lrExit();
+    memset(redirection, 0, sizeof(*redirection));
+    return result;
+}
+
+static Result begin_temporary_patch_redirection(
+    TemporaryPatchRedirection *redirection, u8 storage_id, u64 program_id,
+    const char *patch_path, u8 patch_attributes, const char *base_path) {
+    memset(redirection, 0, sizeof(*redirection));
+    redirection->program_id = program_id;
+
+    Result result = lrInitialize();
+    log_result("exefs-patch-redirect-lr-initialize", result);
+    if (R_FAILED(result)) return result;
+    redirection->lr_initialized = true;
+
+    result = lrOpenLocationResolver(
+        (NcmStorageId)storage_id, &redirection->resolver);
+    log_line("exefs-patch-redirect-open storage=%u result=0x%08x",
+             storage_id, result);
+    if (R_FAILED(result)) goto fail;
+    redirection->resolver_open = true;
+
+    char current[FS_MAX_PATH] = {0};
+    u8 current_attributes[16] = {0};
+    Result current_result = resolve_location_path(
+        &redirection->resolver.s, 0, program_id, current,
+        current_attributes);
+    log_line("exefs-patch-redirect-current program=%016llX result=0x%08x path=%s",
+             (unsigned long long)program_id, current_result,
+             R_SUCCEEDED(current_result) ? current : "(unavailable)");
+    if (R_SUCCEEDED(current_result)) {
+        if (!strcmp(current, patch_path)) {
+            /* NS already points the program at this update (the game is
+               running), so nothing needs to change. */
+            log_line("exefs-patch-redirect-skip reason=already-redirected");
+            end_temporary_patch_redirection(redirection);
+            return 0;
+        }
+        if (base_path && base_path[0] && strcmp(current, base_path)) {
+            /* Something other than the installed base is redirected here.
+               Do not overwrite or erase a redirection we did not create. */
+            result = MAKERESULT(Module_Libnx, LibnxError_BadInput);
+            log_line("exefs-patch-redirect-skip reason=foreign-redirection base=%s",
+                     base_path);
+            goto fail;
+        }
+    } else if (!result_is_missing_program_location(current_result)) {
+        result = current_result;
+        goto fail;
+    }
+
+    result = write_program_redirection(
+        &redirection->resolver.s, program_id, patch_path, patch_attributes);
+    log_line("exefs-patch-redirect-write program=%016llX attributes=%u result=0x%08x path=%s",
+             (unsigned long long)program_id, patch_attributes, result,
+             patch_path);
+    if (R_FAILED(result)) goto fail;
+    redirection->redirected = true;
+
+    char verified[FS_MAX_PATH] = {0};
+    u8 verified_attributes[16] = {0};
+    result = resolve_location_path(
+        &redirection->resolver.s, 0, program_id, verified,
+        verified_attributes);
+    log_line("exefs-patch-redirect-verify program=%016llX attributes=%u result=0x%08x path=%s",
+             (unsigned long long)program_id, verified_attributes[0], result,
+             R_SUCCEEDED(result) ? verified : "(unavailable)");
+    if (R_SUCCEEDED(result) && strcmp(verified, patch_path))
+        result = MAKERESULT(Module_Libnx, LibnxError_BadInput);
+    if (R_SUCCEEDED(result)) return 0;
+
+fail:
+    end_temporary_patch_redirection(redirection);
+    return result;
+}
+
 Result open_title_exefs(
     FsFileSystem *out, u64 program_id,
     const NsApplicationContentMetaStatus *selected,
@@ -1536,6 +1696,30 @@ Result open_title_exefs(
     }
 
     u8 storage_id = (u8)(original ? original->storageID : selected->storageID);
+
+    TemporaryPatchRedirection patch_redirection = {0};
+    if (!location_active && original &&
+        selected->meta_type == NcmContentMetaType_Patch) {
+        char base_path[FS_MAX_PATH] = {0};
+        FsContentAttributes base_attributes = 0;
+        Result base_result = resolve_installed_content_info(
+            original, NcmContentType_Program, base_path, sizeof(base_path),
+            &base_attributes, NULL, NULL);
+        if (R_FAILED(base_result)) base_path[0] = 0;
+        result = begin_temporary_patch_redirection(
+            &patch_redirection, storage_id, runtime_program_id, path,
+            (u8)attributes, base_path);
+        if (R_FAILED(result)) {
+            /* Opening without the redirection would return the base ExeFS
+               under the update's name, so fail instead. */
+            log_line("exefs-diagnostic-attempt-finish attempt=%llu stage=patch-redirect result=0x%08x elapsed-us=%llu",
+                     (unsigned long long)attempt, result,
+                     (unsigned long long)(armTicksToNs(
+                         armGetSystemTick() - started) / 1000));
+            return result;
+        }
+    }
+
     result = open_code_filesystem(
         out, runtime_program_id, storage_id, (u8)attributes);
     log_line("exefs-open-code application=%016llX runtime=%016llX selected=%016llX storage=%u attributes=%u result=0x%08x",
@@ -1579,6 +1763,10 @@ Result open_title_exefs(
                  (unsigned long long)runtime_program_id, result);
     }
     if (R_SUCCEEDED(result)) log_exefs_root(out, attempt);
+    Result redirect_cleanup = end_temporary_patch_redirection(
+        &patch_redirection);
+    if (R_FAILED(redirect_cleanup))
+        log_result("exefs-patch-redirect-cleanup", redirect_cleanup);
     if (location_active) {
         Result map_cleanup_result = end_temporary_program_index_map(&index_map);
         if (R_FAILED(map_cleanup_result))

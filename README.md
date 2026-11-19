@@ -77,11 +77,13 @@ the following devkitPro packages:
   Switch tools, and standard libraries
 - [`switch-sdl2`](https://github.com/devkitPro/pacman-packages/tree/master/switch/SDL2)
 - [`switch-sdl2_ttf`](https://github.com/devkitPro/pacman-packages/tree/master/switch/SDL2_ttf)
+- [`switch-libjpeg-turbo`](https://github.com/devkitPro/pacman-packages/tree/master/switch/libjpeg-turbo)
+  — decodes the game icons
 
 They can be installed with:
 
 ```sh
-sudo dkp-pacman -S switch-dev switch-sdl2 switch-sdl2_ttf
+sudo dkp-pacman -S switch-dev switch-sdl2 switch-sdl2_ttf switch-libjpeg-turbo
 ```
 
 On systems where devkitPro uses the system `pacman`, use `pacman` in place of

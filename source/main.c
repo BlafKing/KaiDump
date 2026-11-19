@@ -4,6 +4,7 @@ AppState g;
 unsigned char *g_copy_buffer;
 FILE *g_log;
 Service g_license_context;
+Service g_license_application_context;
 u64 g_exefs_attempt;
 volatile int g_usb_stop;
 Thread g_usb_thread;
@@ -80,6 +81,8 @@ int main(void) {
     if (g_copy_buffer) free(g_copy_buffer);
     free(g.control_icon);
     if (serviceIsActive(&g_license_context)) serviceClose(&g_license_context);
+    if (serviceIsActive(&g_license_application_context))
+        serviceClose(&g_license_application_context);
     close_ns();
     log_line("KaiDump exit");
     if (g_log) fclose(g_log);

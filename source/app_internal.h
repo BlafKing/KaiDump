@@ -27,7 +27,7 @@
 #include "virtual_file.h"
 #include "virtual_tree.h"
 
-#define KAIDUMP_VERSION "1.0.2"
+#define KAIDUMP_VERSION "1.0.3"
 #define MAX_APPLICATIONS 512
 #define MAX_META_STATUS 64
 #define ROWS_PER_PAGE 10
@@ -53,7 +53,6 @@ typedef enum {
 typedef enum {
     CONTENT_GAME,
     CONTENT_BASE,
-    CONTENT_UPDATE,
     CONTENT_DLC,
 } ContentKind;
 
@@ -96,6 +95,7 @@ typedef struct {
     char title[TITLE_CHARS];
     char version[0x10];
     u8 base_storage;
+    u32 base_version;
     Result metadata_result;
     bool metadata_loaded;
 } Application;
@@ -144,6 +144,7 @@ typedef struct {
     bool kaihen_checked;
     bool kaihen_ready;
     bool romfs_base_only;
+    bool exefs_base_only;
     bool romfs_self_matched;
 } AppState;
 
@@ -151,6 +152,7 @@ extern AppState g;
 extern unsigned char *g_copy_buffer;
 extern FILE *g_log;
 extern Service g_license_context;
+extern Service g_license_application_context;
 extern u64 g_exefs_attempt;
 extern volatile int g_usb_stop;
 extern Thread g_usb_thread;
@@ -207,6 +209,9 @@ Result resolve_installed_content(
     char *path, size_t path_size, FsContentAttributes *attributes);
 void close_code_filesystem(FsFileSystem *filesystem);
 Result mount_title_romfs(u64 application_id, bool *romfs_device);
+/* Keeps the more informative of two RomFS open failures (e.g. a missing
+   update key over a generic InvalidArgument from a later fallback). */
+Result prefer_romfs_failure(Result kept, Result candidate);
 void unmount_title_romfs(const char *name, bool romfs_device);
 const NsApplicationContentMetaStatus *find_program_status(u8 meta_type);
 Result export_selected_content(const NsApplicationContentMetaStatus *status,

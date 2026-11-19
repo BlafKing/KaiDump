@@ -219,12 +219,9 @@ static Result copy_selected_exefs(
     const NsApplicationContentMetaStatus *status, const char *destination,
     PadState *pad) {
     FsFileSystem filesystem = {0};
-    const NsApplicationContentMetaStatus *original =
-        status->meta_type == NcmContentMetaType_Patch
-            ? find_program_status(NcmContentMetaType_Application) : NULL;
     Result result = open_title_exefs(
         &filesystem, g.applications[g.selected].record.application_id,
-        status, original);
+        status, NULL);
     if (R_SUCCEEDED(result)) {
         result = copy_filesystem_tree(
             &filesystem, "/", destination, "exefs", pad);
@@ -274,16 +271,8 @@ static Result copy_selected_romfs(
         fsStorageClose(&storage);
     }
 
+    const Result storage_failure = result;
     FsFileSystem filesystem = {0};
-    if (status->meta_type == NcmContentMetaType_Patch) {
-        result = fsOpenFileSystemWithPatch(
-            &filesystem, status->application_id, (FsFileSystemType)1);
-        log_line("selected-romfs-open-patch id=%016llX result=0x%08x",
-                 (unsigned long long)status->application_id, result);
-    } else {
-        result = MAKERESULT(Module_Libnx, LibnxError_NotFound);
-    }
-    if (R_FAILED(result))
     result = fsOpenFileSystemWithId(
         &filesystem, status->application_id,
         (FsFileSystemType)proxy_type, path, attributes);
@@ -293,8 +282,9 @@ static Result copy_selected_romfs(
         result = copy_filesystem_tree(
             &filesystem, "/", destination, "romfs", pad);
         fsFsClose(&filesystem);
+        return result;
     }
-    return result;
+    return prefer_romfs_failure(storage_failure, result);
 }
 
 Result export_selected_content(
@@ -303,9 +293,6 @@ Result export_selected_content(
     char package[512];
     if (status->meta_type == NcmContentMetaType_Application) {
         snprintf(package, sizeof(package), "%s/base", root);
-    } else if (status->meta_type == NcmContentMetaType_Patch) {
-        snprintf(package, sizeof(package), "%s/updates/%u", root,
-                 status->version);
     } else if (status->meta_type == NcmContentMetaType_AddOnContent ||
                status->meta_type == NcmContentMetaType_DataPatch) {
         snprintf(package, sizeof(package), "%s/dlc/%016llX/0", root,
@@ -315,8 +302,7 @@ Result export_selected_content(
     }
 
     Result exefs_result = 0;
-    if (status->meta_type == NcmContentMetaType_Application ||
-        status->meta_type == NcmContentMetaType_Patch) {
+    if (status->meta_type == NcmContentMetaType_Application) {
         char destination[576];
         snprintf(destination, sizeof(destination), "%s/exefs", package);
         exefs_result = copy_selected_exefs(status, destination, pad);
@@ -351,6 +337,12 @@ Result export_combined_game(u64 application_id, const char *root,
     FsFileSystem exefs = {0};
     Result exefs_result = open_title_exefs(
         &exefs, application_id, selected, update ? base : NULL);
+    if (R_FAILED(exefs_result) && update && base) {
+        log_line("exefs-warning base-only: the update ExeFS could not be opened (0x%08x); using the base ExeFS",
+                 exefs_result);
+        exefs_result = open_title_exefs(&exefs, application_id, base, NULL);
+        if (R_SUCCEEDED(exefs_result)) g.exefs_base_only = true;
+    }
     if (R_SUCCEEDED(exefs_result)) {
         snprintf(destination, sizeof(destination), "%s/exefs", package);
         exefs_result = copy_filesystem_tree(

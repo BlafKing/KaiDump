@@ -60,7 +60,6 @@ static int draw_footer(const char *button1, const char *action1,
 }
 
 static void draw_header(const char *section) {
-    const u32 hos = hosversionGet();
     uiBeginFrame(COLOR_BACKGROUND);
     uiFillRect(0, 0, UI_WIDTH, 92, COLOR_HEADER);
     uiFillRect(0, 90, UI_WIDTH, 2, COLOR_ACCENT);
@@ -80,9 +79,6 @@ static void draw_header(const char *section) {
                                    : UI_RGBA(89, 39, 47, 255));
     uiDrawText(1218 - hen_width + 14, 24, 17,
                kaihen_ready ? COLOR_SUCCESS : COLOR_ERROR, hen_text);
-    uiDrawTextf(1218 - uiTextWidth(16, "HOS 00.00.00"), 58, 16,
-                COLOR_MUTED, "HOS %u.%u.%u", HOSVER_MAJOR(hos),
-                HOSVER_MINOR(hos), HOSVER_MICRO(hos));
 }
 
 static void draw_empty_state(const char *title, const char *message,
@@ -264,7 +260,6 @@ static uint32_t content_type_color(ContentKind kind) {
     switch (kind) {
         case CONTENT_GAME: return COLOR_ACCENT;
         case CONTENT_BASE: return COLOR_ACCENT;
-        case CONTENT_UPDATE: return UI_RGBA(99, 154, 244, 255);
         case CONTENT_DLC: return UI_RGBA(191, 120, 242, 255);
         default: return COLOR_SUBTLE;
     }
@@ -274,7 +269,6 @@ static const char *content_choice_name(const ContentChoice *choice) {
     switch (choice->kind) {
         case CONTENT_GAME: return "Game";
         case CONTENT_BASE: return "Base game";
-        case CONTENT_UPDATE: return "Update";
         case CONTENT_DLC:
             return g.meta[choice->meta_index].meta_type == NcmContentMetaType_DataPatch
                 ? "DLC update" : "DLC";
@@ -340,10 +334,6 @@ static void draw_details(void) {
             } else if (choice->kind == CONTENT_BASE) {
                 uiDrawText(128, y + 28, 14, COLOR_MUTED,
                            "Game card base");
-            } else if (choice->kind == CONTENT_UPDATE) {
-                uiDrawTextf(128, y + 28, 14, COLOR_MUTED,
-                            "Installed update  /  %s",
-                            app->version[0] ? app->version : "version unavailable");
             } else {
                 uiDrawTextf(128, y + 28, 14, COLOR_MUTED,
                             "Version %u  /  %s", meta->version,
