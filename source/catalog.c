@@ -611,3 +611,164 @@ void load_details(void) {
              (unsigned long long)app->record.application_id,
              g.details_result, g.meta_count);
 }
+
+/* NUP application metadata (SPEC §5; type numbers in nup.h) ---------------- */
+
+/* NACP language index -> BCP-47 tag (SPEC Appendix B). */
+static const char *const g_nacp_language_tags[16] = {
+    "en-us", "en-gb", "ja", "fr", "de", "es-419", "es", "it",
+    "nl", "fr-ca", "pt", "ru", "ko", "zh-hant", "zh-hans", "pt-br",
+};
+
+typedef struct {
+    uint8_t *data;
+    size_t size;
+    size_t capacity;
+    bool failed;
+} MetaBuffer;
+
+static void meta_append(MetaBuffer *buffer, const void *data, size_t size) {
+    if (buffer->failed || !size) return;
+    if (buffer->size + size > buffer->capacity) {
+        size_t capacity = buffer->capacity ? buffer->capacity : 4096;
+        while (capacity < buffer->size + size) capacity *= 2;
+        uint8_t *grown = realloc(buffer->data, capacity);
+        if (!grown) {
+            buffer->failed = true;
+            return;
+        }
+        buffer->data = grown;
+        buffer->capacity = capacity;
+    }
+    memcpy(buffer->data + buffer->size, data, size);
+    buffer->size += size;
+}
+
+static void meta_tlv(MetaBuffer *buffer, uint16_t type, const void *data,
+                     uint32_t size) {
+    const uint8_t header[8] = {
+        (uint8_t)type, (uint8_t)(type >> 8), 0, 0,
+        (uint8_t)size, (uint8_t)(size >> 8), (uint8_t)(size >> 16),
+        (uint8_t)(size >> 24),
+    };
+    meta_append(buffer, header, sizeof(header));
+    meta_append(buffer, data, size);
+}
+
+bool build_nup_app_meta(bool include_version, uint8_t **out_meta,
+                        size_t *out_size) {
+    *out_meta = NULL;
+    *out_size = 0;
+    if (g.count <= 0) return false;
+    Application *app = &g.applications[g.selected];
+
+    /* The content route works for Switch 2 titles; NS for older ones. */
+    const uint8_t *icon = NULL;
+    size_t icon_size = 0;
+    bool nacp_valid = false;
+    Result result = load_control_from_content(app);
+    if (R_SUCCEEDED(result)) {
+        nacp_valid = true;
+        if (g.control_icon && g.control_icon_size) {
+            icon = g.control_icon;
+            icon_size = g.control_icon_size;
+        }
+    }
+    if (!icon) {
+        u64 actual = 0;
+        Result ns_result = nsGetApplicationControlData(
+            NsApplicationControlSource_Storage, app->record.application_id,
+            &g.control_data, sizeof(g.control_data), &actual);
+        if (R_SUCCEEDED(ns_result) && actual >= sizeof(g.control_data.nacp)) {
+            nacp_valid = true;
+            size_t size = (size_t)(actual - sizeof(g.control_data.nacp));
+            if (size > sizeof(g.control_data.icon))
+                size = sizeof(g.control_data.icon);
+            if (size) {
+                icon = g.control_data.icon;
+                icon_size = size;
+            }
+        }
+    }
+    NacpStruct *nacp = &g.control_data.nacp;
+
+    /* Per-language names: plain in older NACPs, zlib-compressed (32 entries)
+       when titles_data_format is 1. */
+    NacpLanguageEntry *entries = NULL;
+    NacpLanguageEntry *inflated = NULL;
+    if (nacp_valid && nacp->titles_data_format == 1) {
+        const size_t output_size = 32 * sizeof(NacpLanguageEntry);
+        inflated = calloc(1, output_size);
+        if (inflated) {
+            z_stream stream = {0};
+            stream.next_in = nacp->lang_data.compressed_data.buffer;
+            stream.avail_in = nacp->lang_data.compressed_data.buffer_size;
+            stream.next_out = (Bytef *)inflated;
+            stream.avail_out = output_size;
+            int zresult = inflateInit2(&stream, -15);
+            if (zresult == Z_OK) zresult = inflate(&stream, Z_FINISH);
+            inflateEnd(&stream);
+            if (zresult == Z_STREAM_END) entries = inflated;
+        }
+    } else if (nacp_valid) {
+        entries = nacp->lang_data.lang;
+    }
+
+    const NacpLanguageEntry *primary = NULL;
+    for (int i = 0; entries && i < 16 && !primary; ++i)
+        if (entries[i].name[0]) primary = &entries[i];
+
+    MetaBuffer buffer = {0};
+    if (include_version && nacp_valid)
+        meta_tlv(&buffer, NUP_TLV_NACP, nacp, sizeof(*nacp));
+    if (icon_size) meta_tlv(&buffer, NUP_TLV_ICON, icon, (uint32_t)icon_size);
+    size_t version_length = nacp_valid
+        ? strnlen(nacp->display_version, sizeof(nacp->display_version)) : 0;
+    if (include_version && version_length)
+        meta_tlv(&buffer, NUP_TLV_DISPLAY_VERSION, nacp->display_version,
+                 (uint32_t)version_length);
+    if (primary) {
+        meta_tlv(&buffer, NUP_TLV_TITLE_NAME, primary->name,
+                 (uint32_t)strnlen(primary->name, sizeof(primary->name)));
+    } else if (app->title[0]) {
+        meta_tlv(&buffer, NUP_TLV_TITLE_NAME, app->title, (uint32_t)strlen(app->title));
+    }
+    if (primary && primary->author[0])
+        meta_tlv(&buffer, NUP_TLV_PUBLISHER, primary->author,
+                 (uint32_t)strnlen(primary->author, sizeof(primary->author)));
+
+    /* Localized titles: lang_len, lang, data_len (u32 LE), data. */
+    MetaBuffer localized = {0};
+    int languages = 0;
+    for (int i = 0; entries && i < 16; ++i) {
+        size_t length = strnlen(entries[i].name, sizeof(entries[i].name));
+        if (!length) continue;
+        const char *tag = g_nacp_language_tags[i];
+        const uint8_t tag_length = (uint8_t)strlen(tag);
+        const uint8_t size[4] = {
+            (uint8_t)length, (uint8_t)(length >> 8), (uint8_t)(length >> 16),
+            (uint8_t)(length >> 24),
+        };
+        meta_append(&localized, &tag_length, 1);
+        meta_append(&localized, tag, tag_length);
+        meta_append(&localized, size, sizeof(size));
+        meta_append(&localized, entries[i].name, length);
+        ++languages;
+    }
+    if (languages && !localized.failed)
+        meta_tlv(&buffer, NUP_TLV_LOCALIZED_TITLES, localized.data, (uint32_t)localized.size);
+    free(localized.data);
+    free(inflated);
+
+    log_line("nup-meta title=%016llX content=0x%08x nacp=%u icon=%zu version=%u languages=%d size=%zu failed=%u",
+             (unsigned long long)app->record.application_id, result,
+             nacp_valid, icon_size, include_version && version_length,
+             languages, buffer.size, buffer.failed);
+    if (buffer.failed || !buffer.size) {
+        free(buffer.data);
+        return false;
+    }
+    *out_meta = buffer.data;
+    *out_size = buffer.size;
+    return true;
+}

@@ -331,11 +331,29 @@ static Result export_combined_program(u64 application_id,
         find_program_status(NcmContentMetaType_Application);
     const NsApplicationContentMetaStatus *update =
         find_program_status(NcmContentMetaType_Patch);
+
+    /* Mount the RomFS first: if only the base RomFS is available, the ExeFS
+       must be the base one too, or the dump mixes two game versions. */
+    const bool was_base_only = g.romfs_base_only;
+    g.romfs_base_only = false;
+    bool romfs_device = false;
+    Result romfs_result = mount_title_romfs(application_id, &romfs_device);
+    const bool romfs_mounted = R_SUCCEEDED(romfs_result);
+    const bool romfs_base_only = romfs_mounted && g.romfs_base_only;
+    g.romfs_base_only = was_base_only || romfs_base_only;
+
     const NsApplicationContentMetaStatus *selected = update ? update : base;
+    if (romfs_base_only && update && base) {
+        log_line("exefs-warning base-only: the update RomFS is unavailable; using the base ExeFS to match");
+        selected = base;
+        g.exefs_base_only = true;
+    }
+
     FsFileSystem exefs = {0};
     Result exefs_result = open_title_exefs(
-        &exefs, application_id, selected, update ? base : NULL);
-    if (R_FAILED(exefs_result) && update && base) {
+        &exefs, application_id, selected,
+        selected == update ? base : NULL);
+    if (R_FAILED(exefs_result) && selected == update && base) {
         log_line("exefs-warning base-only: the update ExeFS could not be opened (0x%08x); using the base ExeFS",
                  exefs_result);
         exefs_result = open_title_exefs(&exefs, application_id, base, NULL);
@@ -350,16 +368,17 @@ static Result export_combined_program(u64 application_id,
 
     bool cancelled = R_MODULE(exefs_result) == Module_Libnx &&
                      R_DESCRIPTION(exefs_result) == KAIDUMP_ERROR_CANCELED;
-    Result romfs_result = exefs_result;
-    if (!cancelled) {
-        bool romfs_device = false;
-        romfs_result = mount_title_romfs(application_id, &romfs_device);
-        if (R_SUCCEEDED(romfs_result)) {
+    if (romfs_mounted) {
+        if (cancelled) {
+            romfs_result = exefs_result;
+        } else {
             snprintf(destination, sizeof(destination), "%s/romfs", package);
             romfs_result = copy_tree(
                 "kdrom:/", destination, "romfs", pad);
-            unmount_title_romfs("kdrom", romfs_device);
         }
+        unmount_title_romfs("kdrom", romfs_device);
+    } else if (cancelled) {
+        romfs_result = exefs_result;
     }
 
     Result result = R_FAILED(exefs_result) ? exefs_result : romfs_result;

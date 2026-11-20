@@ -539,6 +539,8 @@ void draw_ftp(void) {
     uiDrawTextf(250, 444, 17, COLOR_SUBTLE, "Transferred  %s", bytes);
     uiDrawText(250, 505, 16, COLOR_SUBTLE,
                "Anonymous login is accepted. Upload and delete commands are disabled.");
+    uiDrawText(250, 531, 16, COLOR_SUBTLE,
+               "Set your FTP client to binary transfers; ASCII mode downloads are refused.");
     draw_footer("B", "Stop server", NULL, NULL, NULL, NULL, NULL, NULL);
     uiEndFrame();
 }

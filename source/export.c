@@ -31,6 +31,18 @@ static void unmount_nup_source(void *user) {
     }
 }
 
+static void unmount_nup_exefs(NupMountContext *context) {
+    if (context->exefs_active) {
+        fsdevUnmountDevice("kdnexe");
+        context->exefs_active = false;
+    }
+    if (context->exefs_fsldr_active) {
+        fsldrExit();
+        context->exefs_fsldr_active = false;
+        log_line("nup-exefs-fsldr-session-released");
+    }
+}
+
 static Result mount_nup_exefs_status(
     const NsApplicationContentMetaStatus *status,
     const NsApplicationContentMetaStatus *original_status,
@@ -136,6 +148,38 @@ static Result mount_nup_romfs_status(
     return prefer_romfs_failure(storage_failure, result);
 }
 
+/* Application metadata for NUP output, built once per export. The "full"
+   variant (with NACP and display version) describes the game as exported;
+   a game card base exported next to a newer update gets the other. */
+static uint8_t *g_nup_meta[2];
+static size_t g_nup_meta_size[2];
+static bool g_nup_meta_built[2];
+
+static void free_nup_meta(void) {
+    for (int i = 0; i < 2; ++i) {
+        free(g_nup_meta[i]);
+        g_nup_meta[i] = NULL;
+        g_nup_meta_size[i] = 0;
+        g_nup_meta_built[i] = false;
+    }
+}
+
+static void attach_nup_meta(const NupInput *input, const ContentChoice *choice,
+                            NupMount *mount) {
+    if (g.output_format != OUTPUT_NUP) return;
+    if (choice->kind != CONTENT_GAME && choice->kind != CONTENT_BASE) return;
+    if (input->program_index != PROGRAM_INDEX_AUTO && input->program_index)
+        return;
+    const int full = choice->kind == CONTENT_GAME ||
+                     !find_program_status(NcmContentMetaType_Patch);
+    if (!g_nup_meta_built[full]) {
+        g_nup_meta_built[full] = true;
+        build_nup_app_meta(full, &g_nup_meta[full], &g_nup_meta_size[full]);
+    }
+    mount->meta = g_nup_meta[full];
+    mount->meta_size = g_nup_meta_size[full];
+}
+
 static Result mount_nup_source(const NupInput *input, NupMount *mount,
                                void *user) {
     NupMountContext *context = user;
@@ -152,15 +196,31 @@ static Result mount_nup_source(const NupInput *input, NupMount *mount,
                 ? -1 : input->program_index);
         result = mount_nup_combined_exefs(choice, context);
         if (R_SUCCEEDED(result)) {
+            const bool was_base_only = g.romfs_base_only;
+            g.romfs_base_only = false;
             bool romfs_device = false;
             result = mount_title_romfs(
                 g.applications[g.selected].record.application_id,
                 &romfs_device);
+            const bool romfs_base_only = g.romfs_base_only;
+            g.romfs_base_only = was_base_only || romfs_base_only;
             if (R_SUCCEEDED(result)) {
                 context->romfs_active = true;
                 context->romfs_device = romfs_device;
                 context->romfs_combined_name = true;
                 snprintf(mount->romfs, sizeof(mount->romfs), "kdrom:/");
+            }
+            if (R_SUCCEEDED(result) && romfs_base_only &&
+                choice->update_index >= 0) {
+                /* Base RomFS with the update's ExeFS would be a mismatched
+                   game, so export the base version consistently. */
+                log_line("exefs-warning base-only: the update RomFS is unavailable; using the base ExeFS to match");
+                unmount_nup_exefs(context);
+                result = mount_nup_exefs_status(
+                    &g.meta[choice->meta_index], NULL,
+                    g.applications[g.selected].record.application_id,
+                    context);
+                if (R_SUCCEEDED(result)) g.exefs_base_only = true;
             }
         }
         set_program_index_override(-1);
@@ -177,6 +237,7 @@ static Result mount_nup_source(const NupInput *input, NupMount *mount,
     }
     if (R_SUCCEEDED(result) && context->exefs_active)
         snprintf(mount->exefs, sizeof(mount->exefs), "kdnexe:/");
+    if (R_SUCCEEDED(result)) attach_nup_meta(input, choice, mount);
     if (R_FAILED(result)) unmount_nup_source(context);
     log_line("nup-source-mount choice=%u kind=%u id=%016llX result=0x%08x exefs=%s romfs=%s",
              input->source_id, choice->kind,
@@ -191,6 +252,10 @@ typedef struct {
     const char *message;
 } NupUiContext;
 
+/* Set when an FTP server itself fails (start-up or socket error), as
+   opposed to the dump being prepared. */
+static bool g_ftp_server_failed;
+
 /* Shared progress callbacks --------------------------------------------- */
 
 static bool nup_cancelled(void *user) {
@@ -199,19 +264,33 @@ static bool nup_cancelled(void *user) {
     return dump_cancelled(context->pad);
 }
 
+/* A B press is reported once (edge-triggered), so remember it: every later
+   check in the same server session must also see the server as stopped. */
+static bool g_ftp_stop_requested;
+
 static bool ftp_stopped(void *user) {
-    return dump_cancelled((PadState *)user);
+    if (!g_ftp_stop_requested)
+        g_ftp_stop_requested = dump_cancelled((PadState *)user);
+    return g_ftp_stop_requested;
 }
 
-static void ftp_status(void *user, const char *status, uint64_t transferred) {
+/* Extracted-file FTP counts files sent; archive FTP keeps the archive's
+   own file count for the result screen. */
+static bool g_ftp_counts_files;
+
+static void ftp_status(void *user, const char *status, uint64_t transferred,
+                       uint64_t files) {
     (void)user;
-    log_line("ftp-status message=%s transferred=%llu", status,
-             (unsigned long long)transferred);
-    if (!strncmp(status, "ftp://", 6))
-        snprintf(g.ftp_address, sizeof(g.ftp_address), "%s", status);
-    else
-        snprintf(g.status, sizeof(g.status), "%s", status);
-    if (transferred) g.copied_bytes = transferred;
+    if (status) {
+        log_line("ftp-status message=%s transferred=%llu files=%llu", status,
+                 (unsigned long long)transferred, (unsigned long long)files);
+        if (!strncmp(status, "ftp://", 6))
+            snprintf(g.ftp_address, sizeof(g.ftp_address), "%s", status);
+        else
+            snprintf(g.status, sizeof(g.status), "%s", status);
+    }
+    g.copied_bytes = transferred;
+    if (g_ftp_counts_files) g.copied_files = files;
     g.screen = SCREEN_FTP;
     draw_ftp();
 }
@@ -346,6 +425,7 @@ static Result serve_selected_nup(PadState *pad) {
     result = ftpServeVirtualFile(
         name, nupArchiveSize(archive), archive, nup_ftp_read, 5000,
         ftp_stopped, ftp_status, pad);
+    if (R_FAILED(result)) g_ftp_server_failed = true;
     log_line("ftp-finish virtual=%s result=0x%08x transferred=%llu",
              name, result, (unsigned long long)g.copied_bytes);
     nupArchiveClose(archive);
@@ -554,14 +634,19 @@ static Result serve_selected_extracted_ftp(PadState *pad) {
     }
 
     g.copied_bytes = 0;
+    g.copied_files = 0;
+    g_ftp_counts_files = true;
     g.ftp_address[0] = 0;
     snprintf(g.status, sizeof(g.status), "Starting extracted-file FTP...");
     g.screen = SCREEN_FTP;
     draw_ftp();
     result = ftpServeDirectory("kdtree:", 5000, ftp_stopped,
                                ftp_status, pad);
-    log_line("ftp-finish extracted result=0x%08x transferred=%llu",
-             result, (unsigned long long)g.copied_bytes);
+    if (R_FAILED(result)) g_ftp_server_failed = true;
+    g_ftp_counts_files = false;
+    log_line("ftp-finish extracted result=0x%08x transferred=%llu files=%llu",
+             result, (unsigned long long)g.copied_bytes,
+             (unsigned long long)g.copied_files);
     virtualTreeUnmount();
     nupArchiveClose(archive);
     g.screen = SCREEN_RESULT;
@@ -654,6 +739,7 @@ static Result serve_selected_tar_ftp(PadState *pad) {
     result = ftpServeVirtualFile(
         name, tarArchiveSize(tar), tar, tar_ftp_read, 5000,
         ftp_stopped, ftp_status, pad);
+    if (R_FAILED(result)) g_ftp_server_failed = true;
     log_line("ftp-finish virtual-tar=%s result=0x%08x transferred=%llu",
              name, result, (unsigned long long)g.copied_bytes);
     tarArchiveClose(tar);
@@ -703,6 +789,9 @@ void dump_title(PadState *pad) {
     g.status[0] = 0;
     g.screen = SCREEN_RESULT;
     g.romfs_base_only = false;
+    g_ftp_server_failed = false;
+    free_nup_meta();
+    g_ftp_stop_requested = false;
     g.exefs_base_only = false;
     g.romfs_self_matched = false;
 
@@ -871,6 +960,16 @@ void dump_title(PadState *pad) {
                          "Content key unavailable (%s); see KaiDump.log",
                          code);
             }
+        } else if (g_ftp_server_failed) {
+            snprintf(g.status, sizeof(g.status),
+                     g.ftp_address[0]
+                         ? "FTP server stopped with an error (%s); see KaiDump.log"
+                         : "FTP server could not start (%s); see KaiDump.log",
+                     code);
+        } else if (g.ftp_enabled || g.usb_enabled) {
+            /* Nothing is written to SD for FTP or USB, so nothing was kept. */
+            snprintf(g.status, sizeof(g.status),
+                     "Export failed (%s); nothing was written to SD", code);
         } else if (!g.copied_files && !g.copied_bytes) {
             snprintf(g.status, sizeof(g.status),
                      "Export failed (%s); nothing was written", code);
@@ -882,6 +981,7 @@ void dump_title(PadState *pad) {
     }
     free(g_copy_buffer);
     g_copy_buffer = NULL;
+    free_nup_meta();
     log_line("export-finish result=0x%08x packages=%d files=%llu bytes=%llu status=%s",
              g.dump_result, completed, (unsigned long long)g.copied_files,
              (unsigned long long)g.copied_bytes, g.status);

@@ -16,6 +16,12 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+void log_line(const char *format, ...);
+
+/* Set while the single-file (TAR/NUP) server runs: its sessions are short,
+   so every command and reply goes to KaiDump.log for diagnosis. */
+static volatile bool g_ftp_trace;
+
 #ifndef MSG_NOSIGNAL
 #define MSG_NOSIGNAL 0
 #endif
@@ -31,7 +37,9 @@ static Result initialize_sockets(void) {
     config.tcp_tx_buf_max_size = 1024 * 1024;
     config.tcp_rx_buf_max_size = 1024 * 1024;
     config.sb_efficiency = 32;
-    config.num_bsd_sessions = 8;
+    /* One session per concurrently blocking socket call: the accept loop
+       plus each client worker (see FTP_MAX_CLIENTS). */
+    config.num_bsd_sessions = 12;
     config.bsd_service_type = BsdServiceType_Auto;
     Result result = socketInitialize(&config);
     return R_SUCCEEDED(result) ? result : socketInitializeDefault();
@@ -67,6 +75,14 @@ static bool send_all(int socket_fd, const void *data, size_t size) {
 #define FTP_SYNC_BUFFER_SIZE (1024 * 1024)
 #define FTP_SOCKET_BUFFER_SIZE (1024 * 1024)
 
+/* Every access to dump data goes through this lock. The virtual tree and
+   the NUP archive mount packages on demand and are not thread-safe, and
+   several FTP clients can now be served at once. Initialized per server. */
+static pthread_mutex_t g_source_mutex;
+
+static void source_lock(void) { pthread_mutex_lock(&g_source_mutex); }
+static void source_unlock(void) { pthread_mutex_unlock(&g_source_mutex); }
+
 typedef struct {
     pthread_t thread;
     pthread_mutex_t mutex;
@@ -100,8 +116,10 @@ static void *reader_main(void *argument) {
         pthread_mutex_unlock(&reader->mutex);
 
         size_t got = 0;
+        source_lock();
         Result result = reader->read_file(
             reader->file, offset, reader->buffers[slot], wanted, &got);
+        source_unlock();
 
         pthread_mutex_lock(&reader->mutex);
         reader->slot = slot;
@@ -187,8 +205,14 @@ static bool reply(int socket_fd, const char *format, ...) {
     va_start(arguments, format);
     int length = vsnprintf(response, sizeof(response), format, arguments);
     va_end(arguments);
-    return length > 0 && (size_t)length < sizeof(response) &&
-           send_all(socket_fd, response, (size_t)length);
+    bool sent = length > 0 && (size_t)length < sizeof(response) &&
+                send_all(socket_fd, response, (size_t)length);
+    if (g_ftp_trace && length > 0) {
+        const char *end = strpbrk(response, "\r\n");
+        log_line("ftp-reply socket=%d sent=%d %.*s", socket_fd, sent ? 1 : 0,
+                 end ? (int)(end - response) : length, response);
+    }
+    return sent;
 }
 
 static int wait_readable(int socket_fd, int milliseconds) {
@@ -241,9 +265,17 @@ static bool send_transfer(int socket_fd, const void *data, size_t size,
     return true;
 }
 
+/* Step and errno of the last open_listener failure, for the log. */
+static const char *g_listener_step = "";
+static int g_listener_errno = 0;
+
 static int open_listener(uint16_t port) {
     int listener = socket(AF_INET, SOCK_STREAM, 0);
-    if (listener < 0) return -1;
+    if (listener < 0) {
+        g_listener_step = "socket";
+        g_listener_errno = errno;
+        return -1;
+    }
     int enabled = 1;
     setsockopt(listener, SOL_SOCKET, SO_REUSEADDR, &enabled, sizeof(enabled));
     struct sockaddr_in address = {
@@ -251,12 +283,56 @@ static int open_listener(uint16_t port) {
         .sin_port = htons(port),
         .sin_addr.s_addr = htonl(INADDR_ANY),
     };
-    if (bind(listener, (struct sockaddr *)&address, sizeof(address)) < 0 ||
-        listen(listener, 2) < 0) {
+    if (bind(listener, (struct sockaddr *)&address, sizeof(address)) < 0) {
+        g_listener_step = "bind";
+        g_listener_errno = errno;
+        close(listener);
+        return -1;
+    }
+    if (listen(listener, 2) < 0) {
+        g_listener_step = "listen";
+        g_listener_errno = errno;
         close(listener);
         return -1;
     }
     return listener;
+}
+
+/* The control port. If it is taken (for example by the game kaiHEN was
+   launched through), try the next few ports; *port returns the one used. */
+#define FTP_PORT_ATTEMPTS 10
+
+static int open_server_listener(uint16_t *port,
+                                FtpStatusCallback status_callback,
+                                void *user) {
+    const uint16_t first = *port;
+    for (uint16_t i = 0; i < FTP_PORT_ATTEMPTS; ++i) {
+        const uint16_t candidate = first + i;
+        int listener = open_listener(candidate);
+        if (listener >= 0) {
+            *port = candidate;
+            return listener;
+        }
+        if (status_callback) {
+            char message[128];
+            snprintf(message, sizeof(message),
+                     "FTP port %u unavailable (%s failed, errno %d)",
+                     candidate, g_listener_step, g_listener_errno);
+            status_callback(user, message, 0, 0);
+        }
+        /* Only a port that cannot be bound is worth retrying elsewhere. */
+        if (strcmp(g_listener_step, "bind")) break;
+    }
+    return -1;
+}
+
+static void report_wait_error(FtpStatusCallback status_callback,
+                              void *user) {
+    if (!status_callback) return;
+    char message[128];
+    snprintf(message, sizeof(message), "FTP server error (select errno %d)",
+             errno);
+    status_callback(user, message, 0, 0);
 }
 
 static int open_passive_listener(uint16_t *port) {
@@ -272,13 +348,126 @@ static int open_passive_listener(uint16_t *port) {
     return listener;
 }
 
+#define FTP_DATA_ACCEPT_TIMEOUT_MS 30000
+
 static int accept_data(int listener, FtpStopCallback stop, void *user) {
-    for (;;) {
+    for (int waited = 0; waited < FTP_DATA_ACCEPT_TIMEOUT_MS; waited += 200) {
         if (stop && stop(user)) return -1;
         int ready = wait_readable(listener, 200);
         if (ready > 0) return accept(listener, NULL, NULL);
         if (ready < 0 && errno != EINTR) return -1;
     }
+    return -1;
+}
+
+/* Server and per-client state -------------------------------------------
+ * The main thread accepts connections and owns the UI; each client runs in
+ * its own worker thread and reports through a small message queue and
+ * byte counters that the main thread turns into status updates. */
+#define FTP_MAX_CLIENTS 8
+#define FTP_MESSAGE_QUEUE 32
+#define FTP_MESSAGE_SIZE 160
+#define FTP_WORKER_STACK_SIZE (256 * 1024)
+
+typedef struct FtpServer FtpServer;
+
+typedef struct {
+    FtpServer *server;
+    pthread_t thread;
+    int client;
+    bool active;
+    bool finished;
+    bool transferring;
+    uint64_t offset;
+    uint64_t position;
+    uint8_t *sync_buffer;
+} FtpWorker;
+
+typedef void (*FtpClientHandler)(int client, struct in_addr ip,
+                                 FtpWorker *worker, void *context);
+static void server_message(FtpServer *server, const char *message);
+
+struct FtpServer {
+    pthread_mutex_t mutex;
+    bool stopping;
+    FtpClientHandler handler;
+    void *context;
+    struct in_addr ip;
+    FtpWorker workers[FTP_MAX_CLIENTS];
+    char messages[FTP_MESSAGE_QUEUE][FTP_MESSAGE_SIZE];
+    unsigned message_first;
+    unsigned message_count;
+    uint64_t completed_bytes;
+    uint64_t completed_files;
+    bool ascii_warned;
+};
+
+/* KaiDump always sends files byte for byte, but in ASCII mode (TYPE A) the
+   client rewrites line endings on its side. FileZilla's "Auto" setting
+   does this for text files and, by default, for files without an
+   extension, which corrupts ExeFS binaries such as main and sdk. Listings
+   are still allowed in ASCII mode; downloads are refused (see RETR).
+   Returns whether the connection is now in ASCII mode. */
+static bool worker_type(FtpWorker *worker, const char *argument) {
+    const bool ascii = argument[0] == 'A' || argument[0] == 'a';
+    if (ascii && !__atomic_exchange_n(&worker->server->ascii_warned, true,
+                                      __ATOMIC_ACQ_REL))
+        server_message(worker->server,
+                       "FTP client uses ASCII mode; set it to binary transfers to download");
+    return ascii;
+}
+
+#define FTP_ASCII_REFUSED \
+    "550 Binary mode required: set your FTP client to binary transfers " \
+    "(TYPE I); ASCII mode would alter the files\r\n"
+
+static bool worker_stop(void *user) {
+    FtpWorker *worker = user;
+    return __atomic_load_n(&worker->server->stopping, __ATOMIC_ACQUIRE);
+}
+
+static void server_message(FtpServer *server, const char *message) {
+    pthread_mutex_lock(&server->mutex);
+    if (server->message_count == FTP_MESSAGE_QUEUE) {
+        server->message_first = (server->message_first + 1) % FTP_MESSAGE_QUEUE;
+        --server->message_count;
+    }
+    unsigned at = (server->message_first + server->message_count) %
+                  FTP_MESSAGE_QUEUE;
+    snprintf(server->messages[at], FTP_MESSAGE_SIZE, "%s", message);
+    ++server->message_count;
+    pthread_mutex_unlock(&server->mutex);
+}
+
+static void worker_message(FtpWorker *worker, const char *message) {
+    server_message(worker->server, message);
+}
+
+static void worker_transfer_begin(FtpWorker *worker, uint64_t offset) {
+    pthread_mutex_lock(&worker->server->mutex);
+    worker->offset = offset;
+    worker->position = offset;
+    worker->transferring = true;
+    pthread_mutex_unlock(&worker->server->mutex);
+}
+
+static void worker_transfer_progress(FtpWorker *worker, uint64_t position) {
+    pthread_mutex_lock(&worker->server->mutex);
+    worker->position = position;
+    pthread_mutex_unlock(&worker->server->mutex);
+}
+
+/* Counts what was actually sent, including the part of a failed transfer. */
+static void worker_transfer_end(FtpWorker *worker, uint64_t position,
+                                bool complete) {
+    FtpServer *server = worker->server;
+    pthread_mutex_lock(&server->mutex);
+    if (position > worker->offset)
+        server->completed_bytes += position - worker->offset;
+    if (complete) ++server->completed_files;
+    worker->transferring = false;
+    worker->offset = worker->position = 0;
+    pthread_mutex_unlock(&server->mutex);
 }
 
 static const char *command_argument(char *line) {
@@ -320,9 +509,12 @@ static bool send_name(int data_socket, const char *name) {
 
 static bool transfer_file(int data_socket, void *file, FtpReadCallback read_file,
                           uint64_t file_size, uint64_t offset,
-                          FtpStopCallback stop, FtpStatusCallback status,
-                          void *user, const char *label) {
+                          FtpWorker *worker, const char *label) {
+    FtpStopCallback stop = worker_stop;
+    void *user = worker;
     bool ok = offset <= file_size;
+    worker_transfer_begin(worker, offset);
+    worker_message(worker, label);
     int socket_buffer = FTP_SOCKET_BUFFER_SIZE;
     setsockopt(data_socket, SOL_SOCKET, SO_SNDBUF,
                &socket_buffer, sizeof(socket_buffer));
@@ -333,17 +525,20 @@ static bool transfer_file(int data_socket, void *file, FtpReadCallback read_file
     setsockopt(data_socket, SOL_SOCKET, SO_SNDTIMEO,
                &send_timeout, sizeof(send_timeout));
 
+    /* Read-ahead (a reader thread and two 4 MiB buffers) only pays off for
+       large files; small files are read directly into a buffer the worker
+       keeps for its whole connection. */
     FtpReader reader = {0};
-    bool read_ahead = ok && reader_start(&reader, file, read_file);
-    uint8_t *sync_buffer = NULL;
-    if (ok && !read_ahead) {
-        sync_buffer = malloc(FTP_SYNC_BUFFER_SIZE);
-        if (!sync_buffer) ok = false;
-        else if (status)
-            status(user, "FTP read-ahead unavailable; using safe mode", offset);
+    const bool large = ok && file_size - offset > FTP_TRANSFER_BUFFER_SIZE;
+    bool read_ahead = large && reader_start(&reader, file, read_file);
+    if (ok && !read_ahead && !worker->sync_buffer) {
+        worker->sync_buffer = malloc(FTP_SYNC_BUFFER_SIZE);
+        if (!worker->sync_buffer) ok = false;
     }
+    uint8_t *sync_buffer = worker->sync_buffer;
+    if (ok && large && !read_ahead)
+        worker_message(worker, "FTP read-ahead unavailable; using safe mode");
     uint64_t transferred = offset;
-    uint64_t next_status = transferred + 16 * 1024 * 1024;
     unsigned next_slot = 0;
     if (read_ahead && transferred < file_size) {
         size_t wanted = file_size - transferred > FTP_TRANSFER_BUFFER_SIZE
@@ -367,9 +562,14 @@ static bool transfer_file(int data_socket, void *file, FtpReadCallback read_file
         } else {
             size_t wanted = file_size - transferred > FTP_SYNC_BUFFER_SIZE
                 ? FTP_SYNC_BUFFER_SIZE : (size_t)(file_size - transferred);
+            source_lock();
             result = read_file(file, transferred, sync_buffer, wanted, &got);
+            source_unlock();
         }
         if (R_FAILED(result) || got == 0) {
+            log_line("ftp-read-failed offset=%llu size=%llu result=0x%08x got=%zu",
+                     (unsigned long long)transferred,
+                     (unsigned long long)file_size, result, got);
             failure = R_FAILED(result)
                 ? "Could not read the selected file"
                 : "The selected file ended before its advertised size";
@@ -393,10 +593,7 @@ static bool transfer_file(int data_socket, void *file, FtpReadCallback read_file
             break;
         }
         transferred = following;
-        if (status && (transferred >= next_status || transferred == file_size)) {
-            status(user, label, transferred);
-            next_status = transferred + 16 * 1024 * 1024;
-        }
+        worker_transfer_progress(worker, transferred);
         if (stop && stop(user)) {
             failure = "FTP transfer cancelled";
             ok = false;
@@ -404,17 +601,27 @@ static bool transfer_file(int data_socket, void *file, FtpReadCallback read_file
         }
     }
     if (reader.thread_started) reader_stop(&reader);
-    free(sync_buffer);
-    if (!ok && status)
-        status(user, failure ? failure : "FTP transfer failed", transferred);
+    if (!ok) worker_message(worker, failure ? failure : "FTP transfer failed");
+    worker_transfer_end(worker, transferred, ok);
     return ok;
 }
 
-static void serve_client(int client, const char *name, uint64_t file_size,
-                         void *file, FtpReadCallback read_file,
-                         struct in_addr ip,
-                         FtpStopCallback stop, FtpStatusCallback status,
-                         void *user) {
+typedef struct {
+    const char *name;
+    uint64_t size;
+    void *file;
+    FtpReadCallback read_file;
+} VirtualFileContext;
+
+static void serve_client(int client, struct in_addr ip, FtpWorker *worker,
+                         void *context_pointer) {
+    const VirtualFileContext *context = context_pointer;
+    const char *name = context->name;
+    const uint64_t file_size = context->size;
+    void *file = context->file;
+    FtpReadCallback read_file = context->read_file;
+    FtpStopCallback stop = worker_stop;
+    void *user = worker;
     size_t name_size = strlen(name);
     bool tar = name_size >= 4 && !strcmp(name + name_size - 4, ".tar");
     const char *sending_status = tar ? "Sending TAR archive"
@@ -423,6 +630,7 @@ static void serve_client(int client, const char *name, uint64_t file_size,
                                       : "NUP transfer complete";
     int passive = -1;
     uint64_t restart = 0;
+    bool ascii = false;
     char input[2048] = {0};
     size_t used = 0;
     reply(client, "220 KaiDump read-only FTP ready\r\n");
@@ -447,11 +655,17 @@ static void serve_client(int client, const char *name, uint64_t file_size,
             const char *argument = command_argument(line);
             for (char *at = line; *at; ++at)
                 if (*at >= 'a' && *at <= 'z') *at -= 'a' - 'A';
+            if (strcmp(line, "NOOP"))
+                log_line("ftp-command socket=%d %s %s", client, line,
+                         strcmp(line, "PASS") ? argument : "***");
 
             if (!strcmp(line, "USER")) reply(client, "331 Any password accepted\r\n");
             else if (!strcmp(line, "PASS")) reply(client, "230 Logged in\r\n");
             else if (!strcmp(line, "SYST")) reply(client, "215 UNIX Type: L8\r\n");
-            else if (!strcmp(line, "TYPE")) reply(client, "200 Type set\r\n");
+            else if (!strcmp(line, "TYPE")) {
+                ascii = worker_type(worker, argument);
+                reply(client, "200 Type set\r\n");
+            }
             else if (!strcmp(line, "MODE")) reply(client, "200 Mode set\r\n");
             else if (!strcmp(line, "STRU")) reply(client, "200 Structure set\r\n");
             else if (!strcmp(line, "CLNT")) reply(client, "200 Client noted\r\n");
@@ -525,7 +739,10 @@ static void serve_client(int client, const char *name, uint64_t file_size,
                                      : "426 Transfer aborted\r\n");
                 }
             } else if (!strcmp(line, "RETR")) {
-                if (!requested_file(argument, name)) {
+                if (ascii) {
+                    restart = 0;
+                    reply(client, FTP_ASCII_REFUSED);
+                } else if (!requested_file(argument, name)) {
                     reply(client, "550 File unavailable\r\n");
                 } else if (passive < 0) {
                     reply(client, "425 Use PASV or EPSV first\r\n");
@@ -536,11 +753,15 @@ static void serve_client(int client, const char *name, uint64_t file_size,
                     passive = -1;
                     bool ok = data >= 0 && transfer_file(
                         data, file, read_file, file_size, restart,
-                        stop, status, user, sending_status);
+                        worker, sending_status);
+                    if (data < 0)
+                        worker_message(worker, "FTP data connection was not opened");
                     if (data >= 0) close(data);
+                    log_line("ftp-retr socket=%d data=%d restart=%llu ok=%d",
+                             client, data, (unsigned long long)restart,
+                             ok ? 1 : 0);
                     restart = 0;
-                    if (status && ok)
-                        status(user, complete_status, file_size);
+                    if (ok) worker_message(worker, complete_status);
                     reply(client, ok ? "226 Transfer complete\r\n"
                                      : "426 Transfer aborted\r\n");
                 }
@@ -557,13 +778,102 @@ static void serve_client(int client, const char *name, uint64_t file_size,
     if (passive >= 0) close(passive);
 }
 
-Result ftpServeVirtualFile(const char *name, uint64_t size, void *file,
-                           FtpReadCallback read_file, uint16_t port,
-                           FtpStopCallback should_stop,
-                           FtpStatusCallback status_callback, void *user) {
-    if (!name || !file || !read_file)
-        return MAKERESULT(Module_Libnx, LibnxError_BadInput);
+static void *worker_main(void *argument) {
+    FtpWorker *worker = argument;
+    FtpServer *server = worker->server;
+    worker_message(worker, "FTP client connected");
+    server->handler(worker->client, server->ip, worker, server->context);
+    close(worker->client);
+    free(worker->sync_buffer);
+    worker->sync_buffer = NULL;
+    worker_message(worker, "FTP client disconnected");
+    __atomic_store_n(&worker->finished, true, __ATOMIC_RELEASE);
+    return NULL;
+}
 
+static uint64_t server_total_bytes(FtpServer *server) {
+    uint64_t total = server->completed_bytes;
+    for (int i = 0; i < FTP_MAX_CLIENTS; ++i) {
+        const FtpWorker *worker = &server->workers[i];
+        if (worker->active && worker->transferring &&
+            worker->position > worker->offset)
+            total += worker->position - worker->offset;
+    }
+    return total;
+}
+
+/* Main thread only: deliver queued messages and the running totals. */
+static void server_flush(FtpServer *server, FtpStatusCallback status_callback,
+                         void *user, uint64_t *reported_bytes,
+                         uint64_t *reported_files) {
+    char messages[FTP_MESSAGE_QUEUE][FTP_MESSAGE_SIZE];
+    unsigned count = 0;
+    pthread_mutex_lock(&server->mutex);
+    for (; count < server->message_count; ++count)
+        memcpy(messages[count],
+               server->messages[(server->message_first + count) %
+                                FTP_MESSAGE_QUEUE],
+               FTP_MESSAGE_SIZE);
+    server->message_first = 0;
+    server->message_count = 0;
+    const uint64_t bytes = server_total_bytes(server);
+    const uint64_t files = server->completed_files;
+    pthread_mutex_unlock(&server->mutex);
+
+    if (!status_callback) return;
+    for (unsigned i = 0; i < count; ++i)
+        status_callback(user, messages[i], bytes, files);
+    if (!count && (bytes != *reported_bytes || files != *reported_files))
+        status_callback(user, NULL, bytes, files);
+    *reported_bytes = bytes;
+    *reported_files = files;
+}
+
+static void server_reap(FtpServer *server, bool wait) {
+    for (int i = 0; i < FTP_MAX_CLIENTS; ++i) {
+        FtpWorker *worker = &server->workers[i];
+        if (!worker->active) continue;
+        if (!wait && !__atomic_load_n(&worker->finished, __ATOMIC_ACQUIRE))
+            continue;
+        pthread_join(worker->thread, NULL);
+        pthread_mutex_lock(&server->mutex);
+        worker->active = false;
+        pthread_mutex_unlock(&server->mutex);
+    }
+}
+
+static bool server_start_worker(FtpServer *server, int client) {
+    FtpWorker *worker = NULL;
+    for (int i = 0; i < FTP_MAX_CLIENTS && !worker; ++i)
+        if (!server->workers[i].active) worker = &server->workers[i];
+    if (!worker) return false;
+
+    pthread_mutex_lock(&server->mutex);
+    *worker = (FtpWorker){
+        .server = server,
+        .client = client,
+        .active = true,
+    };
+    pthread_mutex_unlock(&server->mutex);
+
+    pthread_attr_t attributes;
+    pthread_attr_init(&attributes);
+    pthread_attr_setstacksize(&attributes, FTP_WORKER_STACK_SIZE);
+    int created = pthread_create(&worker->thread, &attributes, worker_main,
+                                 worker);
+    pthread_attr_destroy(&attributes);
+    if (created == 0) return true;
+
+    pthread_mutex_lock(&server->mutex);
+    worker->active = false;
+    pthread_mutex_unlock(&server->mutex);
+    return false;
+}
+
+static Result run_server(uint16_t port, const char *address_suffix,
+                         FtpClientHandler handler, void *context,
+                         FtpStopCallback should_stop,
+                         FtpStatusCallback status_callback, void *user) {
     Result result = initialize_sockets();
     if (R_FAILED(result)) return result;
     bool nifm_ready = false;
@@ -573,41 +883,91 @@ Result ftpServeVirtualFile(const char *name, uint64_t size, void *file,
     if (R_SUCCEEDED(result)) result = nifmGetCurrentIpAddress(&raw_ip);
     if (R_SUCCEEDED(result) && !raw_ip)
         result = MAKERESULT(Module_Libnx, LibnxError_NotFound);
-    int listener = R_SUCCEEDED(result) ? open_listener(port) : -1;
+    int listener = R_SUCCEEDED(result)
+        ? open_server_listener(&port, status_callback, user) : -1;
     if (R_SUCCEEDED(result) && listener < 0) result = io_error();
 
-    struct in_addr ip = {.s_addr = raw_ip};
+    static FtpServer server;
+    memset(&server, 0, sizeof(server));
+    server.handler = handler;
+    server.context = context;
+    server.ip.s_addr = raw_ip;
+    bool locks_ready = false;
+    if (R_SUCCEEDED(result)) {
+        if (pthread_mutex_init(&server.mutex, NULL) != 0) {
+            result = MAKERESULT(Module_Libnx, LibnxError_OutOfMemory);
+        } else if (pthread_mutex_init(&g_source_mutex, NULL) != 0) {
+            pthread_mutex_destroy(&server.mutex);
+            result = MAKERESULT(Module_Libnx, LibnxError_OutOfMemory);
+        } else {
+            locks_ready = true;
+        }
+    }
+
     if (R_SUCCEEDED(result) && status_callback) {
         char message[256];
         snprintf(message, sizeof(message), "ftp://%s:%u/%s",
-                 inet_ntoa(ip), port, name);
-        status_callback(user, message, 0);
+                 inet_ntoa(server.ip), port, address_suffix);
+        status_callback(user, message, 0, 0);
     }
 
+    uint64_t reported_bytes = 0;
+    uint64_t reported_files = 0;
     while (R_SUCCEEDED(result) && (!should_stop || !should_stop(user))) {
+        server_flush(&server, status_callback, user, &reported_bytes,
+                     &reported_files);
+        server_reap(&server, false);
         int ready = wait_readable(listener, 200);
         if (ready < 0 && errno != EINTR) {
+            report_wait_error(status_callback, user);
             result = io_error();
             break;
         }
         if (ready <= 0) continue;
         int client = accept(listener, NULL, NULL);
         if (client < 0) continue;
-        if (status_callback) status_callback(user, "FTP client connected", 0);
-        serve_client(client, name, size, file, read_file, ip,
-                     should_stop, status_callback, user);
-        close(client);
-        if (status_callback) {
-            char message[256];
-            snprintf(message, sizeof(message), "ftp://%s:%u/%s",
-                     inet_ntoa(ip), port, name);
-            status_callback(user, message, 0);
+        /* A client that just disconnected may still hold its slot. */
+        server_reap(&server, false);
+        if (!server_start_worker(&server, client)) {
+            reply(client, "421 Too many connections; try again shortly\r\n");
+            close(client);
+            server_message(&server, "FTP connection refused: too many clients");
         }
     }
 
+    if (locks_ready) {
+        __atomic_store_n(&server.stopping, true, __ATOMIC_RELEASE);
+        if (status_callback)
+            status_callback(user, "Stopping FTP server...", reported_bytes,
+                            reported_files);
+        server_reap(&server, true);
+        server_flush(&server, status_callback, user, &reported_bytes,
+                     &reported_files);
+        pthread_mutex_destroy(&g_source_mutex);
+        pthread_mutex_destroy(&server.mutex);
+    }
     if (listener >= 0) close(listener);
     if (nifm_ready) nifmExit();
     socketExit();
+    return result;
+}
+
+Result ftpServeVirtualFile(const char *name, uint64_t size, void *file,
+                           FtpReadCallback read_file, uint16_t port,
+                           FtpStopCallback should_stop,
+                           FtpStatusCallback status_callback, void *user) {
+    if (!name || !file || !read_file)
+        return MAKERESULT(Module_Libnx, LibnxError_BadInput);
+    VirtualFileContext context = {
+        .name = name,
+        .size = size,
+        .file = file,
+        .read_file = read_file,
+    };
+    g_ftp_trace = true;
+    Result result = run_server(port, name, serve_client, &context,
+                               should_stop, status_callback, user);
+    g_ftp_trace = false;
     return result;
 }
 
@@ -732,11 +1092,21 @@ static bool send_directory_listing(int data, const char *root,
     return ok;
 }
 
-static void serve_directory_client(int client, const char *root,
-                                   struct in_addr ip, FtpStopCallback stop,
-                                   FtpStatusCallback status, void *user) {
+static int locked_stat(const char *path, struct stat *st) {
+    source_lock();
+    int result = stat(path, st);
+    source_unlock();
+    return result;
+}
+
+static void serve_directory_client(int client, struct in_addr ip,
+                                   FtpWorker *worker, void *context) {
+    const char *root = context;
+    FtpStopCallback stop = worker_stop;
+    void *user = worker;
     int passive = -1;
     uint64_t restart = 0;
+    bool ascii = false;
     char current[FS_MAX_PATH] = "/";
     char input[2048] = {0};
     size_t used = 0;
@@ -772,7 +1142,10 @@ static void serve_directory_client(int client, const char *root,
             if (!strcmp(line, "USER")) reply(client, "331 Any password accepted\r\n");
             else if (!strcmp(line, "PASS")) reply(client, "230 Logged in\r\n");
             else if (!strcmp(line, "SYST")) reply(client, "215 UNIX Type: L8\r\n");
-            else if (!strcmp(line, "TYPE") || !strcmp(line, "MODE") ||
+            else if (!strcmp(line, "TYPE")) {
+                ascii = worker_type(worker, argument);
+                reply(client, "200 OK\r\n");
+            } else if (!strcmp(line, "MODE") ||
                      !strcmp(line, "STRU") || !strcmp(line, "CLNT") ||
                      !strcmp(line, "OPTS") || !strcmp(line, "NOOP"))
                 reply(client, "200 OK\r\n");
@@ -782,22 +1155,22 @@ static void serve_directory_client(int client, const char *root,
                 if (!strcmp(line, "CDUP"))
                     path_ok = normalize_path(current, "..", path, sizeof(path)) &&
                         device_path(root, path, local, sizeof(local));
-                if (path_ok && stat(local, &st) == 0 && S_ISDIR(st.st_mode)) {
+                if (path_ok && locked_stat(local, &st) == 0 && S_ISDIR(st.st_mode)) {
                     snprintf(current, sizeof(current), "%s", path);
                     reply(client, "250 Directory changed\r\n");
                 } else reply(client, "550 Directory unavailable\r\n");
             } else if (!strcmp(line, "FEAT")) {
                 reply(client, "211-Features\r\n EPSV\r\n PASV\r\n MDTM\r\n MLST type*;size*;perm*;\r\n REST STREAM\r\n SIZE\r\n UTF8\r\n211 End\r\n");
             } else if (!strcmp(line, "SIZE")) {
-                if (path_ok && stat(local, &st) == 0 && !S_ISDIR(st.st_mode))
+                if (path_ok && locked_stat(local, &st) == 0 && !S_ISDIR(st.st_mode))
                     reply(client, "213 %llu\r\n", (unsigned long long)st.st_size);
                 else reply(client, "550 File unavailable\r\n");
             } else if (!strcmp(line, "MDTM")) {
-                if (path_ok && stat(local, &st) == 0)
+                if (path_ok && locked_stat(local, &st) == 0)
                     reply(client, "213 20260101000000\r\n");
                 else reply(client, "550 Path unavailable\r\n");
             } else if (!strcmp(line, "MLST")) {
-                if (path_ok && stat(local, &st) == 0) {
+                if (path_ok && locked_stat(local, &st) == 0) {
                     if (S_ISDIR(st.st_mode))
                         reply(client, "250-Path details\r\n type=dir;perm=el; %s\r\n250 End\r\n", path_name(path));
                     else
@@ -831,22 +1204,32 @@ static void serve_directory_client(int client, const char *root,
                     int data = accept_data(passive, stop, user);
                     close(passive);
                     passive = -1;
-                    bool ok = data >= 0 && path_ok && send_directory_listing(
-                        data, root, path, !strcmp(line, "MLSD"),
-                        !strcmp(line, "NLST"));
+                    bool ok = false;
+                    if (data >= 0 && path_ok) {
+                        source_lock();
+                        ok = send_directory_listing(
+                            data, root, path, !strcmp(line, "MLSD"),
+                            !strcmp(line, "NLST"));
+                        source_unlock();
+                    }
                     if (data >= 0) close(data);
                     reply(client, ok ? "226 Transfer complete\r\n"
                                      : "426 Transfer aborted\r\n");
                 }
             } else if (!strcmp(line, "RETR")) {
-                if (!path_ok || stat(local, &st) != 0 || S_ISDIR(st.st_mode))
+                if (ascii) {
+                    restart = 0;
+                    reply(client, FTP_ASCII_REFUSED);
+                } else if (!path_ok || locked_stat(local, &st) != 0 || S_ISDIR(st.st_mode))
                     reply(client, "550 File unavailable\r\n");
                 else if (restart > (uint64_t)st.st_size) {
                     restart = 0;
                     reply(client, "551 Restart position is past end of file\r\n");
                 } else if (passive < 0) reply(client, "425 Use PASV or EPSV first\r\n");
                 else {
+                    source_lock();
                     FILE *handle = fopen(local, "rb");
+                    source_unlock();
                     if (!handle) {
                         reply(client, "550 File unavailable\r\n");
                         close(passive);
@@ -859,14 +1242,18 @@ static void serve_directory_client(int client, const char *root,
                         DirectoryFile file = {.handle = handle};
                         bool ok = data >= 0 && transfer_file(
                             data, &file, read_directory_file,
-                            (uint64_t)st.st_size, restart, stop, status, user,
+                            (uint64_t)st.st_size, restart, worker,
                             "Sending extracted file");
+                        if (data < 0)
+                            worker_message(worker, "FTP data connection was not opened");
+                        source_lock();
                         fclose(handle);
+                        source_unlock();
                         if (data >= 0) close(data);
                         restart = 0;
-                        if (status && ok)
-                            status(user, "Extracted file transfer complete",
-                                   (uint64_t)st.st_size);
+                        if (ok)
+                            worker_message(worker,
+                                           "Extracted file transfer complete");
                         reply(client, ok ? "226 Transfer complete\r\n"
                                          : "426 Transfer aborted\r\n");
                     }
@@ -889,46 +1276,6 @@ Result ftpServeDirectory(const char *root, uint16_t port,
                          FtpStatusCallback status_callback, void *user) {
     if (!root || !root[0])
         return MAKERESULT(Module_Libnx, LibnxError_BadInput);
-    Result result = initialize_sockets();
-    if (R_FAILED(result)) return result;
-    bool nifm_ready = false;
-    result = nifmInitialize(NifmServiceType_User);
-    if (R_SUCCEEDED(result)) nifm_ready = true;
-    u32 raw_ip = 0;
-    if (R_SUCCEEDED(result)) result = nifmGetCurrentIpAddress(&raw_ip);
-    if (R_SUCCEEDED(result) && !raw_ip)
-        result = MAKERESULT(Module_Libnx, LibnxError_NotFound);
-    int listener = R_SUCCEEDED(result) ? open_listener(port) : -1;
-    if (R_SUCCEEDED(result) && listener < 0) result = io_error();
-
-    struct in_addr ip = {.s_addr = raw_ip};
-    if (R_SUCCEEDED(result) && status_callback) {
-        char message[256];
-        snprintf(message, sizeof(message), "ftp://%s:%u/", inet_ntoa(ip), port);
-        status_callback(user, message, 0);
-    }
-    while (R_SUCCEEDED(result) && (!should_stop || !should_stop(user))) {
-        int ready = wait_readable(listener, 200);
-        if (ready < 0 && errno != EINTR) {
-            result = io_error();
-            break;
-        }
-        if (ready <= 0) continue;
-        int client = accept(listener, NULL, NULL);
-        if (client < 0) continue;
-        if (status_callback) status_callback(user, "FTP client connected", 0);
-        serve_directory_client(client, root, ip, should_stop,
-                               status_callback, user);
-        close(client);
-        if (status_callback) {
-            char message[256];
-            snprintf(message, sizeof(message), "ftp://%s:%u/",
-                     inet_ntoa(ip), port);
-            status_callback(user, message, 0);
-        }
-    }
-    if (listener >= 0) close(listener);
-    if (nifm_ready) nifmExit();
-    socketExit();
-    return result;
+    return run_server(port, "", serve_directory_client, (void *)root,
+                      should_stop, status_callback, user);
 }

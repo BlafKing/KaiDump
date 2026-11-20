@@ -53,14 +53,18 @@ size_t load_control_icon(void) {
     return icon_size;
 }
 
+static Mutex g_log_mutex;
+
 void log_line(const char *format, ...) {
     if (!g_log) return;
+    mutexLock(&g_log_mutex);
     va_list args;
     va_start(args, format);
     vfprintf(g_log, format, args);
     va_end(args);
     fputc('\n', g_log);
     fflush(g_log);
+    mutexUnlock(&g_log_mutex);
 }
 
 const char *result_name(Result result) {

@@ -27,7 +27,7 @@
 #include "virtual_file.h"
 #include "virtual_tree.h"
 
-#define KAIDUMP_VERSION "1.0.4"
+#define KAIDUMP_VERSION "1.0.5"
 #define MAX_APPLICATIONS 512
 #define MAX_META_STATUS 64
 #define ROWS_PER_PAGE 10
@@ -218,6 +218,10 @@ const NsApplicationContentMetaStatus *find_program_status(u8 meta_type);
 #define PROGRAM_INDEX_AUTO 0xff
 void set_program_index_override(int program_index);
 s32 game_program_indices(u8 *out, s32 capacity);
+/* Serialized NUP application meta TLVs (name, icon, ...) for the selected
+   title; include_version adds the NACP and display version. */
+bool build_nup_app_meta(bool include_version, uint8_t **out_meta,
+                        size_t *out_size);
 Result export_selected_content(const NsApplicationContentMetaStatus *status,
                                const char *root, PadState *pad);
 Result export_combined_game(u64 application_id, const char *root,

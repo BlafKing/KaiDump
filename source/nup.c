@@ -54,6 +54,9 @@ typedef struct {
     uint32_t file_count;
     uint8_t kind;
     uint8_t flags;
+    uint8_t *meta;
+    size_t meta_size;
+    uint64_t meta_offset;
 } PlanPackage;
 
 typedef struct {
@@ -68,6 +71,7 @@ typedef struct {
     size_t file_capacity;
     uint64_t toc_size;
     uint64_t blob_offset;
+    uint64_t blob_end;
     uint64_t file_size;
 } Plan;
 
@@ -335,6 +339,164 @@ static Result scan_external_exefs(Plan *plan, const NupMount *view,
     return 0;
 }
 
+/* Package meta blocks (SPEC §5) ------------------------------------------
+ * A TLV list per package, stored after the blob region like the reference
+ * packer does. Records are sorted by type; for a type that appears twice the
+ * package-level record (NPDM, build ID, provenance) wins. */
+#define NUP_NPDM_MAX_SIZE (256 * 1024)
+#define NUP_META_MAX_RECORDS 32
+
+typedef struct {
+    uint16_t type;
+    const uint8_t *data;
+    uint32_t size;
+} MetaRecord;
+
+/* Size of an ExeFS file of the mounted package, or false if it is absent. */
+static bool exefs_file_size(const NupMount *view, const char *name,
+                            uint64_t *size, uint64_t *source_offset) {
+    if (view->exefs[0]) {
+        char *path = join_path(view->exefs, name);
+        if (!path) return false;
+        struct stat st;
+        bool found = stat(path, &st) == 0 && !S_ISDIR(st.st_mode);
+        free(path);
+        if (found) *size = (uint64_t)st.st_size;
+        return found;
+    }
+    for (size_t i = 0; i < view->exefs_file_count; ++i) {
+        if (!view->exefs_files[i].name ||
+            strcmp(view->exefs_files[i].name, name))
+            continue;
+        *size = view->exefs_files[i].size;
+        *source_offset = view->exefs_files[i].source_offset;
+        return true;
+    }
+    return false;
+}
+
+static bool read_exefs_file(const NupMount *view, const char *name,
+                            void *buffer, size_t size) {
+    uint64_t file_size = 0;
+    uint64_t source_offset = 0;
+    if (!exefs_file_size(view, name, &file_size, &source_offset) ||
+        file_size < size)
+        return false;
+    if (view->exefs[0]) {
+        char *path = join_path(view->exefs, name);
+        if (!path) return false;
+        FILE *file = fopen(path, "rb");
+        free(path);
+        if (!file) return false;
+        bool ok = fread(buffer, 1, size, file) == size;
+        fclose(file);
+        return ok;
+    }
+    if (!view->read_exefs) return false;
+    size_t got = 0;
+    return R_SUCCEEDED(view->read_exefs(view->read_exefs_user, source_offset,
+                                        buffer, size, &got)) && got == size;
+}
+
+static void add_meta_record(MetaRecord *records, size_t *count,
+                            uint16_t type, const void *data, uint32_t size) {
+    if (*count >= NUP_META_MAX_RECORDS) return;
+    records[(*count)++] = (MetaRecord){type, data, size};
+}
+
+static Result build_package_meta(PlanPackage *package, const NupMount *view) {
+    MetaRecord records[NUP_META_MAX_RECORDS];
+    size_t count = 0;
+
+    uint8_t *npdm = NULL;
+    uint64_t npdm_size = 0;
+    uint64_t unused_offset = 0;
+    if (exefs_file_size(view, "main.npdm", &npdm_size, &unused_offset) &&
+        npdm_size && npdm_size <= NUP_NPDM_MAX_SIZE) {
+        npdm = malloc((size_t)npdm_size);
+        if (npdm && read_exefs_file(view, "main.npdm", npdm, (size_t)npdm_size))
+            add_meta_record(records, &count, NUP_TLV_NPDM, npdm,
+                            (uint32_t)npdm_size);
+    }
+
+    /* Build ID = ModuleId, bytes 0x40..0x60 of main (NSO0 or NRO0). */
+    uint8_t header[0x60];
+    if (read_exefs_file(view, "main", header, sizeof(header)) &&
+        (!memcmp(header, "NSO0", 4) || !memcmp(header + 0x10, "NRO0", 4)))
+        add_meta_record(records, &count, NUP_TLV_BUILD_ID, header + 0x40, 0x20);
+
+    static const char source_dump[] = "KaiDump";
+    add_meta_record(records, &count, NUP_TLV_SOURCE_DUMP, source_dump,
+                    sizeof(source_dump) - 1);
+
+    const uint8_t *extra = view->meta;
+    for (size_t at = 0; extra && at + 8 <= view->meta_size;) {
+        uint16_t type = (uint16_t)(extra[at] | extra[at + 1] << 8);
+        uint32_t size = (uint32_t)extra[at + 4] | (uint32_t)extra[at + 5] << 8 |
+                        (uint32_t)extra[at + 6] << 16 |
+                        (uint32_t)extra[at + 7] << 24;
+        if (size > view->meta_size - at - 8) break;
+        add_meta_record(records, &count, type, extra + at + 8, size);
+        at += 8 + (size_t)size;
+    }
+
+    /* Stable insertion sort by type, then drop later duplicates. */
+    for (size_t i = 1; i < count; ++i) {
+        MetaRecord record = records[i];
+        size_t j = i;
+        while (j && records[j - 1].type > record.type) {
+            records[j] = records[j - 1];
+            --j;
+        }
+        records[j] = record;
+    }
+    size_t total = 0;
+    for (size_t i = 0; i < count; ++i)
+        if (!i || records[i].type != records[i - 1].type)
+            total += 8 + records[i].size;
+
+    Result result = 0;
+    uint8_t *block = total ? malloc(total) : NULL;
+    if (total && !block) {
+        result = MAKERESULT(Module_Libnx, LibnxError_OutOfMemory);
+    } else {
+        size_t at = 0;
+        for (size_t i = 0; i < count; ++i) {
+            if (i && records[i].type == records[i - 1].type) continue;
+            const MetaRecord *record = &records[i];
+            block[at + 0] = (uint8_t)record->type;
+            block[at + 1] = (uint8_t)(record->type >> 8);
+            block[at + 2] = block[at + 3] = 0;
+            for (int b = 0; b < 4; ++b)
+                block[at + 4 + b] = (uint8_t)(record->size >> (8 * b));
+            memcpy(block + at + 8, record->data, record->size);
+            at += 8 + record->size;
+        }
+        package->meta = block;
+        package->meta_size = total;
+    }
+    free(npdm);
+    return result;
+}
+
+/* Copies from the meta region (after the blob region) into output. */
+static size_t read_meta_region(const Plan *plan, uint64_t offset,
+                               uint8_t *output, size_t size) {
+    for (size_t i = 0; i < plan->package_count; ++i) {
+        const PlanPackage *package = &plan->packages[i];
+        if (!package->meta_size || offset < package->meta_offset ||
+            offset >= package->meta_offset + package->meta_size)
+            continue;
+        uint64_t within = offset - package->meta_offset;
+        size_t amount = package->meta_size - within > size
+            ? size : (size_t)(package->meta_size - within);
+        memcpy(output, package->meta + within, amount);
+        return amount;
+    }
+    memset(output, 0, size);
+    return size;
+}
+
 static void free_plan(Plan *plan) {
     for (size_t i = 0; i < plan->dir_count; ++i) {
         free(plan->dirs[i].name);
@@ -346,6 +508,8 @@ static void free_plan(Plan *plan) {
         free(plan->files[i].name);
         free(plan->files[i].path);
     }
+    for (size_t i = 0; plan->packages && i < plan->package_count; ++i)
+        free(plan->packages[i].meta);
     free(plan->inputs);
     free(plan->packages);
     free(plan->dirs);
@@ -410,6 +574,8 @@ static Result scan_sources(Plan *plan, const NupInput *inputs,
                            "romfs"))
                 result = MAKERESULT(Module_Libnx, LibnxError_OutOfMemory);
         }
+        if (R_SUCCEEDED(result))
+            result = build_package_meta(package, &view);
         unmount(mount_user);
         if (R_FAILED(result)) return result;
         if (!view.exefs[0] && !view.exefs_file_count && !view.romfs[0])
@@ -442,6 +608,13 @@ static Result scan_sources(Plan *plan, const NupInput *inputs,
         file->extent_offset = position;
         file->extent_size = file->size;
         position += file->size;
+    }
+    plan->blob_end = position;
+    for (size_t i = 0; i < plan->package_count; ++i) {
+        PlanPackage *package = &plan->packages[i];
+        if (!package->meta_size) continue;
+        package->meta_offset = position;
+        position += package->meta_size;
     }
     plan->file_size = position;
     return 0;
@@ -752,6 +925,8 @@ static Result build_prefix(Plan *plan, uint8_t **out_prefix) {
             .version = source->version,
             .kind = source->kind,
             .flags = source->flags,
+            .meta_offset = source->meta_offset,
+            .meta_size = (uint32_t)source->meta_size,
         };
     }
 
@@ -862,6 +1037,14 @@ Result nupCreateDirect(const char *output_path, const NupInput *inputs,
         result = process_files(&plan, output, mount, unmount, mount_user,
                                copy_buffer, buffer_size, cancelled, cancel_user,
                                written_bytes, packed_files);
+    for (size_t i = 0; R_SUCCEEDED(result) && i < plan.package_count; ++i) {
+        const PlanPackage *package = &plan.packages[i];
+        if (!package->meta_size) continue;
+        if (fseeko(output, (off_t)package->meta_offset, SEEK_SET) != 0 ||
+            fwrite(package->meta, 1, package->meta_size, output) !=
+                package->meta_size)
+            result = io_error();
+    }
     uint8_t *prefix = NULL;
     if (R_SUCCEEDED(result)) result = build_prefix(&plan, &prefix);
     if (R_SUCCEEDED(result) &&
@@ -1064,11 +1247,27 @@ Result nupArchiveRead(NupArchive *archive, uint64_t offset, void *buffer,
             continue;
         }
 
+        if (offset >= archive->plan.blob_end) {
+            size_t amount = read_meta_region(&archive->plan, offset, output,
+                                             size);
+            output += amount;
+            offset += amount;
+            size -= amount;
+            *bytes_read += amount;
+            continue;
+        }
+
         size_t index = find_file(&archive->plan, offset);
         if (index >= archive->plan.file_count) {
-            memset(output, 0, size);
-            *bytes_read += size;
-            return 0;
+            /* Alignment padding before the meta region. */
+            size_t amount = archive->plan.blob_end - offset > size
+                ? size : (size_t)(archive->plan.blob_end - offset);
+            memset(output, 0, amount);
+            output += amount;
+            offset += amount;
+            size -= amount;
+            *bytes_read += amount;
+            continue;
         }
         PlanFile *file = &archive->plan.files[index];
         if (offset < file->extent_offset) {

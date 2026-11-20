@@ -47,7 +47,11 @@ sdmc:/switch/KaiDump/dumps/Game title [Title ID]/
 ```
 
 FTP shows the address to connect to once the server starts. FTP access is
-read-only, so files cannot be uploaded or deleted.
+read-only, so files cannot be uploaded or deleted. Set your FTP client to
+binary transfers (in FileZilla: Transfer > Transfer type > Binary). In ASCII
+or "Auto" mode, clients change line endings on their side, which also
+corrupts files without an extension such as ExeFS binaries, so KaiDump
+refuses downloads in ASCII mode.
 
 For USB, connect the console after the USB screen appears and open the
 `KaiDump` device on your computer. Windows supports MTP directly. Linux can use

@@ -714,14 +714,19 @@ static Result mount_explicit_program_content(u64 application_id,
     log_result("ncmInitialize", result);
     if (R_FAILED(result)) return result;
 
-    /* Prefer the installed update. Fall back to base application content. */
+    /* An update's RomFS is a delta on top of the base RomFS. Opened on its
+       own it can even mount, but every file that comes from the base then
+       fails to read (EIO), so this route only uses the base, and reports
+       that the update is missing. Merged RomFS needs the routes above. */
     const u8 wanted_types[] = {
-        NcmContentMetaType_Patch,
         NcmContentMetaType_Application,
     };
     Result last = MAKERESULT(Module_Libnx, LibnxError_NotFound);
     Result reported = 0;
-    bool update_failed = false;
+    bool update_failed =
+        find_program_status(NcmContentMetaType_Patch) != NULL;
+    if (update_failed)
+        log_line("romfs-explicit-skip-update reason=update-romfs-needs-base");
     for (size_t wanted = 0; wanted < sizeof(wanted_types); ++wanted) {
         for (s32 i = 0; i < g.meta_count; ++i) {
             NsApplicationContentMetaStatus *status = &g.meta[i];
