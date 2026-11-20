@@ -666,12 +666,22 @@ bool build_nup_app_meta(bool include_version, uint8_t **out_meta,
     const uint8_t *icon = NULL;
     size_t icon_size = 0;
     bool nacp_valid = false;
+    g_capture_control_icons = true;
     Result result = load_control_from_content(app);
+    g_capture_control_icons = false;
+    if (R_FAILED(result)) free_control_icons();
     if (R_SUCCEEDED(result)) {
         nacp_valid = true;
         if (g.control_icon && g.control_icon_size) {
             icon = g.control_icon;
             icon_size = g.control_icon_size;
+        }
+        /* The default icon (TLV 0x0003) is the American English one. */
+        for (int i = 0; i < g_control_icon_count; ++i) {
+            if (strcmp(g_control_icons[i].language, "AmericanEnglish"))
+                continue;
+            icon = g_control_icons[i].data;
+            icon_size = g_control_icons[i].size;
         }
     }
     if (!icon) {
@@ -760,10 +770,39 @@ bool build_nup_app_meta(bool include_version, uint8_t **out_meta,
     free(localized.data);
     free(inflated);
 
-    log_line("nup-meta title=%016llX content=0x%08x nacp=%u icon=%zu version=%u languages=%d size=%zu failed=%u",
+    /* Localized icons: the same record layout, with the image bytes. */
+    MetaBuffer localized_icons = {0};
+    int icon_languages = 0;
+    for (int i = 0; i < g_control_icon_count; ++i) {
+        const ControlIcon *control_icon = &g_control_icons[i];
+        const char *tag = nupLanguageTag(control_icon->language);
+        if (!tag) {
+            log_line("nup-meta-icon-skip language=%s reason=unknown-language",
+                     control_icon->language);
+            continue;
+        }
+        const uint8_t tag_length = (uint8_t)strlen(tag);
+        const uint32_t length = (uint32_t)control_icon->size;
+        const uint8_t size[4] = {
+            (uint8_t)length, (uint8_t)(length >> 8), (uint8_t)(length >> 16),
+            (uint8_t)(length >> 24),
+        };
+        meta_append(&localized_icons, &tag_length, 1);
+        meta_append(&localized_icons, tag, tag_length);
+        meta_append(&localized_icons, size, sizeof(size));
+        meta_append(&localized_icons, control_icon->data, length);
+        ++icon_languages;
+    }
+    if (icon_languages && !localized_icons.failed)
+        meta_tlv(&buffer, NUP_TLV_LOCALIZED_ICONS, localized_icons.data,
+                 (uint32_t)localized_icons.size);
+    free(localized_icons.data);
+
+    log_line("nup-meta title=%016llX content=0x%08x nacp=%u icon=%zu version=%u languages=%d icons=%d size=%zu failed=%u",
              (unsigned long long)app->record.application_id, result,
              nacp_valid, icon_size, include_version && version_length,
-             languages, buffer.size, buffer.failed);
+             languages, icon_languages, buffer.size, buffer.failed);
+    free_control_icons();
     if (buffer.failed || !buffer.size) {
         free(buffer.data);
         return false;

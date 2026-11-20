@@ -106,6 +106,25 @@ Result nupPrepareTree(NupArchive **out_archive, const NupInput *inputs,
                       NupCancelCallback cancelled, void *cancel_user,
                       uint64_t *file_count);
 
+/* Finds a TLV in a serialized meta block (NUP SPEC §5). */
+bool nupMetaFind(const void *meta, size_t meta_size, uint16_t type,
+                 const uint8_t **data, uint32_t *size);
+
+/* NUP language tag for an NACP language name ("AmericanEnglish" -> "en-us"),
+   or NULL. */
+const char *nupLanguageTag(const char *nacp_language);
+
+/* The control files of an extracted game (control.nacp and every
+   icon_<Language>.dat) as stored in a package's meta TLVs. */
+#define NUP_MAX_CONTROL_FILES 34
+typedef struct {
+    char name[64];
+    const uint8_t *data;
+    uint32_t size;
+} NupControlFile;
+size_t nupControlFiles(const void *meta, size_t meta_size,
+                       NupControlFile *files, size_t capacity);
+
 uint64_t nupArchiveSize(const NupArchive *archive);
 Result nupArchiveRead(NupArchive *archive, uint64_t offset, void *buffer,
                       size_t size, size_t *bytes_read);

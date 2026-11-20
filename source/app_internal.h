@@ -222,6 +222,19 @@ s32 game_program_indices(u8 *out, s32 capacity);
    title; include_version adds the NACP and display version. */
 bool build_nup_app_meta(bool include_version, uint8_t **out_meta,
                         size_t *out_size);
+
+/* Every icon_<Language>.dat of the control data, read only while
+   g_capture_control_icons is set (the grid loads just one icon). */
+#define MAX_CONTROL_ICONS 32
+typedef struct {
+    char language[48];
+    u8 *data;
+    size_t size;
+} ControlIcon;
+extern bool g_capture_control_icons;
+extern ControlIcon g_control_icons[MAX_CONTROL_ICONS];
+extern int g_control_icon_count;
+void free_control_icons(void);
 Result export_selected_content(const NsApplicationContentMetaStatus *status,
                                const char *root, PadState *pad);
 Result export_combined_game(u64 application_id, const char *root,

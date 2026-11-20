@@ -148,9 +148,11 @@ static Result mount_nup_romfs_status(
     return prefer_romfs_failure(storage_failure, result);
 }
 
-/* Application metadata for NUP output, built once per export. The "full"
-   variant (with NACP and display version) describes the game as exported;
-   a game card base exported next to a newer update gets the other. */
+/* Application metadata, built once per export: NUP meta TLVs, and the
+   control.nacp / icon files of extracted and TAR output. The "full" variant
+   (with NACP and display version) describes the game as exported; a base
+   exported without its installed update gets the other, so a 1.0.0 dump
+   never carries the update's version. */
 static uint8_t *g_nup_meta[2];
 static size_t g_nup_meta_size[2];
 static bool g_nup_meta_built[2];
@@ -164,20 +166,95 @@ static void free_nup_meta(void) {
     }
 }
 
-static void attach_nup_meta(const NupInput *input, const ContentChoice *choice,
-                            NupMount *mount) {
-    if (g.output_format != OUTPUT_NUP) return;
-    if (choice->kind != CONTENT_GAME && choice->kind != CONTENT_BASE) return;
-    if (input->program_index != PROGRAM_INDEX_AUTO && input->program_index)
-        return;
-    const int full = choice->kind == CONTENT_GAME ||
-                     !find_program_status(NcmContentMetaType_Patch);
+static bool select_app_meta(const ContentChoice *choice, bool base_only,
+                            const uint8_t **meta, size_t *meta_size) {
+    *meta = NULL;
+    *meta_size = 0;
+    if (choice->kind != CONTENT_GAME && choice->kind != CONTENT_BASE)
+        return false;
+    const int full = !find_program_status(NcmContentMetaType_Patch) ||
+                     (choice->kind == CONTENT_GAME && !base_only);
     if (!g_nup_meta_built[full]) {
         g_nup_meta_built[full] = true;
         build_nup_app_meta(full, &g_nup_meta[full], &g_nup_meta_size[full]);
     }
-    mount->meta = g_nup_meta[full];
-    mount->meta_size = g_nup_meta_size[full];
+    *meta = g_nup_meta[full];
+    *meta_size = g_nup_meta_size[full];
+    return *meta != NULL;
+}
+
+static void attach_nup_meta(const NupInput *input, const ContentChoice *choice,
+                            bool base_only, NupMount *mount) {
+    /* A NUP carries one game: extra programs are not packed (see
+       build_nup_inputs), and extracted output gets the files per program. */
+    if (g.output_format == OUTPUT_NUP &&
+        input->program_index != PROGRAM_INDEX_AUTO && input->program_index)
+        return;
+    const uint8_t *meta = NULL;
+    size_t meta_size = 0;
+    if (select_app_meta(choice, base_only, &meta, &meta_size)) {
+        mount->meta = meta;
+        mount->meta_size = meta_size;
+    }
+}
+
+static Result write_memory_file(const char *path, const uint8_t *data,
+                                uint32_t size) {
+    FILE *file = fopen(path, "wb");
+    if (!file) return MAKERESULT(Module_Libnx, LibnxError_IoError);
+    bool ok = fwrite(data, 1, size, file) == size;
+    if (fclose(file) != 0) ok = false;
+    if (ok) {
+        g.copied_bytes += size;
+        ++g.copied_files;
+    }
+    return ok ? 0 : MAKERESULT(Module_Libnx, LibnxError_IoError);
+}
+
+/* Extracted to SD: the same control.nacp and icon files that the tree adds
+   for FTP, USB and TAR (see tree_add_control_files in nup.c). */
+static void write_control_files(const char *package, const ContentChoice *choice,
+                                bool base_only) {
+    const uint8_t *meta = NULL;
+    size_t meta_size = 0;
+    if (!select_app_meta(choice, base_only, &meta, &meta_size)) return;
+    NupControlFile files[NUP_MAX_CONTROL_FILES];
+    size_t count = nupControlFiles(meta, meta_size, files,
+                                   NUP_MAX_CONTROL_FILES);
+    size_t failed = 0;
+    for (size_t i = 0; i < count; ++i) {
+        char path[640];
+        const int length = snprintf(path, sizeof(path), "%s/%s", package,
+                                    files[i].name);
+        if (length < 0 || (size_t)length >= sizeof(path) ||
+            R_FAILED(write_memory_file(path, files[i].data, files[i].size)))
+            ++failed;
+    }
+    log_line("control-files package=%s files=%zu failed=%zu", package, count,
+             failed);
+}
+
+static void write_selected_control_files(const char *root,
+                                         const ContentChoice *choice,
+                                         bool base_only) {
+    char package[512];
+    if (choice->kind == CONTENT_BASE) {
+        snprintf(package, sizeof(package), "%s/base", root);
+        write_control_files(package, choice, base_only);
+        return;
+    }
+    if (choice->kind != CONTENT_GAME) return;
+    snprintf(package, sizeof(package), "%s/game", root);
+    write_control_files(package, choice, base_only);
+    /* Switch 2 Editions: every program shares the application's control. */
+    u8 programs[8] = {0};
+    s32 program_count = game_program_indices(programs, 8);
+    for (s32 i = 0; i < program_count; ++i) {
+        if (!programs[i]) continue;
+        snprintf(package, sizeof(package), "%s/game/program%u", root,
+                 programs[i]);
+        write_control_files(package, choice, base_only);
+    }
 }
 
 static Result mount_nup_source(const NupInput *input, NupMount *mount,
@@ -189,6 +266,7 @@ static Result mount_nup_source(const NupInput *input, NupMount *mount,
     ContentChoice *choice = &g.choices[input->source_id];
     NsApplicationContentMetaStatus *status = &g.meta[choice->meta_index];
     Result result = 0;
+    bool base_only = false;
 
     if (choice->kind == CONTENT_GAME) {
         set_program_index_override(
@@ -221,6 +299,7 @@ static Result mount_nup_source(const NupInput *input, NupMount *mount,
                     g.applications[g.selected].record.application_id,
                     context);
                 if (R_SUCCEEDED(result)) g.exefs_base_only = true;
+                base_only = true;
             }
         }
         set_program_index_override(-1);
@@ -237,7 +316,7 @@ static Result mount_nup_source(const NupInput *input, NupMount *mount,
     }
     if (R_SUCCEEDED(result) && context->exefs_active)
         snprintf(mount->exefs, sizeof(mount->exefs), "kdnexe:/");
-    if (R_SUCCEEDED(result)) attach_nup_meta(input, choice, mount);
+    if (R_SUCCEEDED(result)) attach_nup_meta(input, choice, base_only, mount);
     if (R_FAILED(result)) unmount_nup_source(context);
     log_line("nup-source-mount choice=%u kind=%u id=%016llX result=0x%08x exefs=%s romfs=%s",
              input->source_id, choice->kind,
@@ -889,13 +968,18 @@ void dump_title(PadState *pad) {
             for (s32 i = 0; i < g.choice_count; ++i) {
                 ContentChoice *choice = &g.choices[i];
                 if (!choice->selected) continue;
+                const bool was_base_only = g.romfs_base_only;
+                g.romfs_base_only = false;
                 Result result = choice->kind == CONTENT_GAME
                     ? export_combined_game(app->record.application_id, root, pad)
                     : export_selected_content(&g.meta[choice->meta_index], root, pad);
+                const bool base_only = g.romfs_base_only;
+                g.romfs_base_only = was_base_only || base_only;
                 if (R_FAILED(result)) {
                     g.dump_result = result;
                     break;
                 }
+                write_selected_control_files(root, choice, base_only);
                 ++completed;
             }
         }

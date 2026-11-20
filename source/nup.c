@@ -79,6 +79,9 @@ typedef struct {
     char *path;
     uint64_t size;
     uint32_t file_index;
+    /* Files that only exist in the tree (control.nacp, icon): their bytes,
+       owned by the plan's package meta. NULL for files from the sources. */
+    const uint8_t *data;
     uint32_t parent;
     uint32_t *children;
     size_t child_count;
@@ -497,6 +500,112 @@ static size_t read_meta_region(const Plan *plan, uint64_t offset,
     return size;
 }
 
+bool nupMetaFind(const void *meta, size_t meta_size, uint16_t type,
+                 const uint8_t **data, uint32_t *size) {
+    const uint8_t *block = meta;
+    size_t at = 0;
+    while (block && at + 8 <= meta_size) {
+        const uint16_t record_type = (uint16_t)(block[at] | block[at + 1] << 8);
+        const uint32_t record_size = (uint32_t)block[at + 4] |
+            (uint32_t)block[at + 5] << 8 | (uint32_t)block[at + 6] << 16 |
+            (uint32_t)block[at + 7] << 24;
+        if (record_size > meta_size - at - 8) break;
+        if (record_type == type) {
+            *data = block + at + 8;
+            *size = record_size;
+            return true;
+        }
+        at += 8 + (size_t)record_size;
+    }
+    return false;
+}
+
+/* NACP languages (icon_<Name>.dat in the control data) and the BCP-47
+   tags NUP uses for them (SPEC Appendix B). */
+static const struct {
+    const char *name;
+    const char *tag;
+} g_nup_languages[] = {
+    {"AmericanEnglish", "en-us"},    {"BritishEnglish", "en-gb"},
+    {"Japanese", "ja"},              {"French", "fr"},
+    {"German", "de"},                {"LatinAmericanSpanish", "es-419"},
+    {"Spanish", "es"},               {"Italian", "it"},
+    {"Dutch", "nl"},                 {"CanadianFrench", "fr-ca"},
+    {"Portuguese", "pt"},            {"Russian", "ru"},
+    {"Korean", "ko"},                {"TraditionalChinese", "zh-hant"},
+    {"SimplifiedChinese", "zh-hans"}, {"BrazilianPortuguese", "pt-br"},
+};
+#define NUP_LANGUAGE_COUNT \
+    (sizeof(g_nup_languages) / sizeof(g_nup_languages[0]))
+
+const char *nupLanguageTag(const char *name) {
+    for (size_t i = 0; i < NUP_LANGUAGE_COUNT; ++i)
+        if (!strcmp(g_nup_languages[i].name, name))
+            return g_nup_languages[i].tag;
+    return NULL;
+}
+
+static const char *language_name(const uint8_t *tag, size_t length) {
+    for (size_t i = 0; i < NUP_LANGUAGE_COUNT; ++i) {
+        const char *known = g_nup_languages[i].tag;
+        if (strlen(known) != length) continue;
+        size_t at = 0;
+        while (at < length) {
+            char c = (char)tag[at];
+            if (c >= 'A' && c <= 'Z') c += 'a' - 'A';
+            if (c != known[at]) break;
+            ++at;
+        }
+        if (at == length) return g_nup_languages[i].name;
+    }
+    return NULL;
+}
+
+size_t nupControlFiles(const void *meta, size_t meta_size,
+                       NupControlFile *files, size_t capacity) {
+    size_t count = 0;
+    const uint8_t *data = NULL;
+    uint32_t size = 0;
+    if (count < capacity &&
+        nupMetaFind(meta, meta_size, NUP_TLV_NACP, &data, &size)) {
+        snprintf(files[count].name, sizeof(files[count].name),
+                 "control.nacp");
+        files[count].data = data;
+        files[count++].size = size;
+    }
+    const size_t icons_start = count;
+    if (nupMetaFind(meta, meta_size, NUP_TLV_LOCALIZED_ICONS, &data, &size)) {
+        size_t at = 0;
+        while (at < size && count < capacity) {
+            const size_t tag_length = data[at];
+            if (at + 1 + tag_length + 4 > size) break;
+            const uint8_t *tag = data + at + 1;
+            const uint8_t *length = tag + tag_length;
+            const uint32_t icon_size = (uint32_t)length[0] |
+                (uint32_t)length[1] << 8 | (uint32_t)length[2] << 16 |
+                (uint32_t)length[3] << 24;
+            const size_t icon_at = at + 1 + tag_length + 4;
+            if (icon_size > size - icon_at) break;
+            const char *name = language_name(tag, tag_length);
+            if (name) {
+                snprintf(files[count].name, sizeof(files[count].name),
+                         "icon_%s.dat", name);
+                files[count].data = data + icon_at;
+                files[count++].size = icon_size;
+            }
+            at = icon_at + icon_size;
+        }
+    }
+    if (count == icons_start && count < capacity &&
+        nupMetaFind(meta, meta_size, NUP_TLV_ICON, &data, &size)) {
+        snprintf(files[count].name, sizeof(files[count].name),
+                 "icon_AmericanEnglish.dat");
+        files[count].data = data;
+        files[count++].size = size;
+    }
+    return count;
+}
+
 static void free_plan(Plan *plan) {
     for (size_t i = 0; i < plan->dir_count; ++i) {
         free(plan->dirs[i].name);
@@ -644,6 +753,34 @@ static Result tree_add(NupArchive *archive, const char *path, bool directory,
     return 0;
 }
 
+static Result tree_add_memory(NupArchive *archive, const char *path,
+                              const uint8_t *data, uint32_t size) {
+    Result result = tree_add(archive, path, false, size, UINT32_MAX);
+    if (R_SUCCEEDED(result))
+        archive->tree[archive->tree_count - 1].data = data;
+    return result;
+}
+
+/* Emulators read an extracted game's name, version and icons from
+   control.nacp and icon_<Language>.dat next to its exefs/ and romfs/. */
+static Result tree_add_control_files(NupArchive *archive,
+                                     const PlanPackage *package,
+                                     const char *prefix) {
+    NupControlFile files[NUP_MAX_CONTROL_FILES];
+    size_t count = nupControlFiles(package->meta, package->meta_size, files,
+                                   NUP_MAX_CONTROL_FILES);
+    Result result = 0;
+    for (size_t i = 0; R_SUCCEEDED(result) && i < count; ++i) {
+        char path[FS_MAX_PATH];
+        const int length = snprintf(path, sizeof(path), "%s/%s", prefix,
+                                    files[i].name);
+        if (length < 0 || (size_t)length >= sizeof(path))
+            return MAKERESULT(Module_Libnx, LibnxError_BadInput);
+        result = tree_add_memory(archive, path, files[i].data, files[i].size);
+    }
+    return result;
+}
+
 static char *tree_join(const char *parent, const char *name) {
     size_t parent_size = strlen(parent);
     size_t name_size = strlen(name);
@@ -739,6 +876,11 @@ static Result build_tree(NupArchive *archive) {
         if (R_SUCCEEDED(result))
             result = tree_walk_directory(
                 archive, archive->plan.packages[i].root_dir, prefix);
+        if (R_SUCCEEDED(result) && (layout == NUP_LAYOUT_GAME ||
+                                    layout == NUP_LAYOUT_GAME_PROGRAM ||
+                                    layout == NUP_LAYOUT_BASE))
+            result = tree_add_control_files(
+                archive, &archive->plan.packages[i], prefix);
     }
     if (R_FAILED(result)) return result;
 
@@ -1354,7 +1496,17 @@ Result nupTreeRead(NupArchive *archive, const char *path, uint64_t offset,
     size_t index = tree_find_index(archive, normalized);
     if (index == SIZE_MAX || archive->tree[index].directory)
         return MAKERESULT(Module_Libnx, LibnxError_NotFound);
-    return read_plan_file(archive, archive->tree[index].file_index,
+    const TreeEntry *entry = &archive->tree[index];
+    if (entry->data) {
+        *bytes_read = 0;
+        if (offset >= entry->size || !size) return 0;
+        if ((uint64_t)size > entry->size - offset)
+            size = (size_t)(entry->size - offset);
+        memcpy(buffer, entry->data + offset, size);
+        *bytes_read = size;
+        return 0;
+    }
+    return read_plan_file(archive, entry->file_index,
                           offset, buffer, size, bytes_read);
 }
 

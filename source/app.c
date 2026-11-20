@@ -12,7 +12,56 @@ void refresh_ftp_availability(void) {
              ((const u8 *)&address)[2], ((const u8 *)&address)[3]);
 }
 
+bool g_capture_control_icons;
+ControlIcon g_control_icons[MAX_CONTROL_ICONS];
+int g_control_icon_count;
+
+void free_control_icons(void) {
+    for (int i = 0; i < g_control_icon_count; ++i) free(g_control_icons[i].data);
+    memset(g_control_icons, 0, sizeof(g_control_icons));
+    g_control_icon_count = 0;
+}
+
+static void capture_control_icons(void) {
+    free_control_icons();
+    DIR *directory = opendir("kdctl:/");
+    if (!directory) return;
+    struct dirent *entry;
+    while ((entry = readdir(directory)) != NULL &&
+           g_control_icon_count < MAX_CONTROL_ICONS) {
+        size_t length = strlen(entry->d_name);
+        if (length < 10 || strncmp(entry->d_name, "icon_", 5) ||
+            strcmp(entry->d_name + length - 4, ".dat")) continue;
+        ControlIcon *icon = &g_control_icons[g_control_icon_count];
+        const size_t language_length = length - 9;
+        if (language_length >= sizeof(icon->language)) continue;
+        char path[FS_MAX_PATH];
+        int written = snprintf(path, sizeof(path), "kdctl:/%s", entry->d_name);
+        if (written < 0 || (size_t)written >= sizeof(path)) continue;
+        struct stat file_info;
+        if (stat(path, &file_info) != 0 || file_info.st_size <= 0 ||
+            file_info.st_size > 8 * 1024 * 1024) continue;
+        FILE *file = fopen(path, "rb");
+        if (!file) continue;
+        icon->data = malloc((size_t)file_info.st_size);
+        if (icon->data)
+            icon->size = fread(icon->data, 1, (size_t)file_info.st_size, file);
+        fclose(file);
+        if (!icon->data || icon->size != (size_t)file_info.st_size) {
+            free(icon->data);
+            memset(icon, 0, sizeof(*icon));
+            continue;
+        }
+        memcpy(icon->language, entry->d_name + 5, language_length);
+        icon->language[language_length] = 0;
+        ++g_control_icon_count;
+    }
+    closedir(directory);
+    log_line("control-icons captured=%d", g_control_icon_count);
+}
+
 size_t load_control_icon(void) {
+    if (g_capture_control_icons) capture_control_icons();
     DIR *directory = opendir("kdctl:/");
     if (!directory) return 0;
 
