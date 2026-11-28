@@ -46,6 +46,12 @@ SD card exports are saved under:
 sdmc:/switch/KaiDump/dumps/Game title [Title ID]/
 ```
 
+Extracted and TAR dumps put the game in `game/` (`exefs/`, `romfs/`,
+`control.nacp` and the game's icons) and DLC in `dlc/`. Nintendo Switch 2
+Editions contain two versions of the game, which go in `game_switch1/` and
+`game_switch2/`; keep both, as some Switch 2 versions use data from the
+Switch 1 version. NUP files hold the Switch 1 version of these games.
+
 FTP shows the address to connect to once the server starts. FTP access is
 read-only, so files cannot be uploaded or deleted. Set your FTP client to
 binary transfers (in FileZilla: Transfer > Transfer type > Binary). In ASCII
@@ -59,6 +65,33 @@ libmtp, GVfs, or KIO, while macOS needs an MTP application such as OpenMTP.
 
 Press B to cancel an export or stop a transfer server. Existing destination
 files with the same name are replaced.
+
+## Known limitations
+
+These are known and do not need to be reported as issues.
+
+- **Updates of Switch 1 games cannot be dumped.** The console only merges
+  an update into its game while that game is running, and kaiHEN can only
+  run KaiDump inside Switch 2 games. KaiDump then dumps the base version.
+  This also applies to the Switch 1 version of Switch 2 Editions; their
+  Switch 2 version usually comes complete with the update and is dumped as
+  normal. It is a kaiHEN limitation that KaiDump cannot fix for now.
+- **Updates of Switch 2 games** can only be dumped when kaiHEN was started
+  through that game. Start kaiHEN through the game, then open KaiDump from
+  the same hbmenu session.
+- **Games that keep their data in the update** cannot be dumped when the
+  update cannot be read, because the installed base version is incomplete on
+  its own and there is nothing to fall back to. Examples are Hogwarts Legacy
+  and Dave the Diver.
+- **Some games only load their license while they are running.** They cannot
+  be dumped unless kaiHEN was started through them, which is only possible
+  for Switch 2 games.
+- **DLC updates** are usually not included, for the same reason as game
+  updates. The DLC is then dumped without its update.
+
+KaiDump checks the installed update when you open a game. If it cannot be
+read, the Game row and the confirmation screen say so before you start the
+dump.
 
 ## Logs
 

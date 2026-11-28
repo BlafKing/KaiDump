@@ -126,6 +126,8 @@ const char *result_name(Result result) {
         case 0xc08: return "RegisteredProgramLocationNotFound";
         case 0x1408: return "DebugProgramLocationNotFound";
         case 0x7d202: return "PartitionNotFound";
+        case R_VALUE(MAKERESULT(Module_Libnx, KAIDUMP_ERROR_DATA_IN_UPDATE)):
+            return "DataOnlyInUpdate";
         case 0x7d802: return "NcaExternalKeyNotFound";
         case 0x1fb402: return "RomNcaHeaderSignature1VerificationFailed";
         case 0x235e02: return "InvalidNcaId";

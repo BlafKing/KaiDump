@@ -36,6 +36,7 @@ enum {
     NUP_LAYOUT_UPDATE,
     NUP_LAYOUT_DLC,
     NUP_LAYOUT_GAME_PROGRAM,
+    NUP_LAYOUT_FOLDER,  /* tree output only: under NupInput.folder */
 };
 
 typedef struct {
@@ -46,6 +47,7 @@ typedef struct {
     uint8_t flags;
     uint8_t layout;
     uint8_t program_index;
+    char folder[40];
 } NupInput;
 
 typedef struct {
@@ -53,6 +55,15 @@ typedef struct {
     uint64_t size;
     uint64_t source_offset;
 } NupExternalFile;
+
+/* A file that tree output (extracted, TAR) adds next to a package's exefs/
+   and romfs/: control.nacp and every icon_<Language>.dat. */
+#define NUP_MAX_CONTROL_FILES 34
+typedef struct {
+    char name[64];
+    const uint8_t *data;
+    uint32_t size;
+} NupControlFile;
 
 typedef Result (*NupReadCallback)(void *source, uint64_t offset, void *buffer,
                                   size_t size, size_t *bytes_read);
@@ -69,10 +80,15 @@ typedef struct {
        type. The NPDM, build ID and provenance TLVs are added by nup. */
     const void *meta;
     size_t meta_size;
-    /* Set when the mounted content is not the version the input asked for
-       (an update that could not be opened, so the base was mounted). */
+    /* Set when the mounted content is not the version the input asked for:
+       the base game because its update could not be opened, or a DLC with
+       its update merged. */
     uint32_t version;
     bool version_set;
+    /* Optional files for tree output, placed next to exefs/ and romfs/.
+       nup copies them; NUP output ignores them. */
+    const NupControlFile *control_files;
+    size_t control_file_count;
 } NupMount;
 
 typedef bool (*NupCancelCallback)(void *user);
@@ -110,24 +126,27 @@ Result nupPrepareTree(NupArchive **out_archive, const NupInput *inputs,
                       NupCancelCallback cancelled, void *cancel_user,
                       uint64_t *file_count);
 
+/* Placed next to game_switch1/ and game_switch2/ in extracted and TAR
+   output of Switch 2 Editions. */
+#define NUP_EDITION_README \
+    "This game is a Nintendo Switch 2 Edition and contains two versions:\n" \
+    "\n" \
+    "game_switch1/  the Nintendo Switch 1 version\n" \
+    "game_switch2/  the Nintendo Switch 2 version\n" \
+    "\n" \
+    "Some games ship the Switch 2 version as a complete game of its own.\n" \
+    "Others keep most of their data in the Switch 1 version, which the\n" \
+    "Switch 2 version then needs as well. Keep both folders together.\n" \
+    "\n" \
+    "Dumped with KaiDump.\n"
+
 /* Finds a TLV in a serialized meta block (NUP SPEC §5). */
 bool nupMetaFind(const void *meta, size_t meta_size, uint16_t type,
                  const uint8_t **data, uint32_t *size);
 
 /* NUP language tag for an NACP language name ("AmericanEnglish" -> "en-us"),
-   or NULL. */
+   or NULL for a language nup does not know. */
 const char *nupLanguageTag(const char *nacp_language);
-
-/* The control files of an extracted game (control.nacp and every
-   icon_<Language>.dat) as stored in a package's meta TLVs. */
-#define NUP_MAX_CONTROL_FILES 34
-typedef struct {
-    char name[64];
-    const uint8_t *data;
-    uint32_t size;
-} NupControlFile;
-size_t nupControlFiles(const void *meta, size_t meta_size,
-                       NupControlFile *files, size_t capacity);
 
 uint64_t nupArchiveSize(const NupArchive *archive);
 Result nupArchiveRead(NupArchive *archive, uint64_t offset, void *buffer,
@@ -138,5 +157,10 @@ bool nupTreeList(NupArchive *archive, const char *path, size_t index,
 Result nupTreeRead(NupArchive *archive, const char *path, uint64_t offset,
                    void *buffer, size_t size, size_t *bytes_read);
 uint64_t nupTreeTotalSize(const NupArchive *archive);
+/* Files that exist only in the tree (control.nacp, icons, README.txt), by
+   index; false past the last one. */
+bool nupTreeMemoryFile(const NupArchive *archive, size_t index,
+                       const char **path, const uint8_t **data,
+                       uint32_t *size);
 void nupArchiveDeactivate(NupArchive *archive);
 void nupArchiveClose(NupArchive *archive);

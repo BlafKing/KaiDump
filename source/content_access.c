@@ -564,6 +564,14 @@ void title_from_nacp(Application *app, NacpStruct *nacp) {
     copy_display_text(app->version, sizeof(app->version), nacp->display_version);
 }
 
+/* Switch 2 Editions ship a control (NACP, icons) per program; this selects
+   the one of the program at this id offset. 0 is the application's own. */
+static u8 g_control_id_offset;
+
+void set_control_id_offset(u8 id_offset) {
+    g_control_id_offset = id_offset;
+}
+
 Result load_control_from_content(Application *app) {
     free(g.control_icon);
     g.control_icon = NULL;
@@ -633,8 +641,13 @@ Result load_control_from_content(Application *app) {
                      status->meta_type, status->storageID, last, key.type,
                      key.install_type, key.version);
             if (R_SUCCEEDED(last))
-                last = ncmContentMetaDatabaseGetContentIdByType(
-                    &database, &content_id, &key, NcmContentType_Control);
+                last = g_control_id_offset
+                    ? ncmContentMetaDatabaseGetContentIdByTypeAndIdOffset(
+                          &database, &content_id, &key,
+                          NcmContentType_Control, g_control_id_offset)
+                    : ncmContentMetaDatabaseGetContentIdByType(
+                          &database, &content_id, &key,
+                          NcmContentType_Control);
             if (R_SUCCEEDED(last))
                 last = get_content_attributes(&database, &key, &content_id,
                                               NcmContentType_Control,
@@ -696,7 +709,7 @@ static int romfs_failure_rank(Result result) {
     if (R_SUCCEEDED(result)) return -1;
     const u32 value = R_VALUE(result);
     if (value == 0x7d802) return 3;
-    if (value == 0x7d202) return 2;
+    if (result_is_data_in_update(result)) return 2;
     if (value == 0x2ee202 ||
         value == R_VALUE(MAKERESULT(Module_Libnx, LibnxError_NotFound)))
         return 0;
@@ -706,6 +719,18 @@ static int romfs_failure_rank(Result result) {
 Result prefer_romfs_failure(Result kept, Result candidate) {
     return romfs_failure_rank(candidate) > romfs_failure_rank(kept)
         ? candidate : kept;
+}
+
+/* Whether a storage starts with a RomFS header (its first field is the
+   header size, 0x50). A base whose RomFS lives in its update can open but
+   read as zeros, which romfsMountFromStorage reports as OutOfMemory. */
+static bool storage_has_romfs_header(FsStorage *storage) {
+    u64 header_size = 0;
+    Result result = fsStorageRead(storage, 0, &header_size,
+                                  sizeof(header_size));
+    log_line("romfs-header-check result=0x%08x header-size=0x%llx", result,
+             (unsigned long long)header_size);
+    return R_SUCCEEDED(result) && header_size == 0x50;
 }
 
 static Result mount_explicit_program_content(u64 application_id,
@@ -800,6 +825,14 @@ static Result mount_explicit_program_content(u64 application_id,
                          status->meta_type, content_attributes, last);
             }
             ncmContentStorageClose(&storage);
+            if (R_SUCCEEDED(last) && !is_update && update_failed &&
+                !storage_has_romfs_header(&data_storage)) {
+                fsStorageClose(&data_storage);
+                last = MAKERESULT(Module_Libnx, KAIDUMP_ERROR_DATA_IN_UPDATE);
+                log_line("romfs-base-empty: the base has no RomFS of its own; the game's data is only in the update");
+                reported = prefer_romfs_failure(reported, last);
+                continue;
+            }
             if (R_SUCCEEDED(last)) {
                 last = romfsMountFromStorage(data_storage, 0, "kdrom");
                 log_line("romfs-storage-path type=%u result=0x%08x",
@@ -1102,53 +1135,53 @@ const NsApplicationContentMetaStatus *find_dlc_update(
     return found;
 }
 
-/* Read-only diagnostic: the DLC paths registered in the add-on content
-   location resolver (lr 3). Since 15.0.0 it can hold a second path per DLC
-   (GetRegisteredAddOnContentPaths, 5), which is where a DLC update is
-   paired with its DLC. Nothing is registered or changed here. */
-static void log_registered_addon_paths(u64 data_id) {
-    Result result = lrInitialize();
-    if (R_FAILED(result)) {
-        log_result("dlc-update-lr-initialize", result);
-        return;
-    }
-    Service resolver = {0};
-    result = serviceDispatch(lrGetServiceSession(), 3,
-        .out_num_objects = 1,
-        .out_objects = &resolver,
-    );
-    if (R_SUCCEEDED(result)) {
-        char path[0x300] = {0};
-        char other[0x300] = {0};
-        result = serviceDispatchIn(&resolver, 5, data_id,
-            .buffer_attrs = {
-                SfBufferAttr_HipcMapAlias | SfBufferAttr_Out,
-                SfBufferAttr_HipcMapAlias | SfBufferAttr_Out,
-            },
-            .buffers = {{path, sizeof(path)}, {other, sizeof(other)}},
-        );
-        path[sizeof(path) - 1] = 0;
-        other[sizeof(other) - 1] = 0;
-        log_line("dlc-update-lr-registered dlc=%016llX result=0x%08x path=%s other=%s",
-                 (unsigned long long)data_id, result,
-                 R_SUCCEEDED(result) && path[0] ? path : "(none)",
-                 R_SUCCEEDED(result) && other[0] ? other : "(none)");
-        serviceClose(&resolver);
-    } else {
-        log_result("dlc-update-lr-open-addon", result);
-    }
-    lrExit();
-}
-
 static s64 storage_size(FsStorage *storage) {
     s64 size = -1;
     if (R_FAILED(fsStorageGetSize(storage, &size))) size = -1;
     return size;
 }
 
-Result open_patched_addon_storage(const NsApplicationContentMetaStatus *dlc,
-                                  const NsApplicationContentMetaStatus *patch,
-                                  FsStorage *out) {
+/* One merge decision per DLC and export. A NUP or tree export mounts each
+   source several times (planning, hashing, reading); the content must be
+   the same every time, so the first decision is kept and later mounts
+   reopen exactly that storage. */
+typedef struct {
+    u64 dlc_id;
+    u32 version;
+    bool merged;
+    u8 storage;
+    s64 size;
+} DlcUpdateDecision;
+#define DLC_UPDATE_DECISIONS 256
+static DlcUpdateDecision g_dlc_update_decisions[DLC_UPDATE_DECISIONS];
+static s32 g_dlc_update_decision_count;
+
+void reset_dlc_update_decisions(void) {
+    g_dlc_update_decision_count = 0;
+}
+
+static void remember_dlc_update(const NsApplicationContentMetaStatus *dlc,
+                                const NsApplicationContentMetaStatus *patch,
+                                bool merged, u8 storage, s64 size) {
+    if (g_dlc_update_decision_count >= DLC_UPDATE_DECISIONS) {
+        log_line("dlc-update-decision-not-cached dlc=%016llX",
+                 (unsigned long long)dlc->application_id);
+        return;
+    }
+    g_dlc_update_decisions[g_dlc_update_decision_count++] =
+        (DlcUpdateDecision){
+            .dlc_id = dlc->application_id,
+            .version = patch->version,
+            .merged = merged,
+            .storage = storage,
+            .size = size,
+        };
+}
+
+static Result decide_patched_addon_storage(
+    const NsApplicationContentMetaStatus *dlc,
+    const NsApplicationContentMetaStatus *patch, FsStorage *out) {
+    const Result not_merged = MAKERESULT(Module_Libnx, LibnxError_NotFound);
     char patch_path[FS_MAX_PATH] = {0};
     FsContentAttributes patch_attributes = 0;
     /* Also prepares the update's license when it needs one. */
@@ -1160,8 +1193,10 @@ Result open_patched_addon_storage(const NsApplicationContentMetaStatus *dlc,
              (unsigned long long)patch->application_id, patch->version,
              patch->storageID, result,
              R_SUCCEEDED(result) ? patch_path : "(unavailable)");
-    if (R_FAILED(result)) return result;
-    log_registered_addon_paths(dlc->application_id);
+    if (R_FAILED(result)) {
+        remember_dlc_update(dlc, patch, false, 0, -1);
+        return not_merged;
+    }
 
     /* A DLC update is a delta on top of its DLC, like a game update. Opened
        on its own it reports the size of the updated DLC, but reads of data
@@ -1191,7 +1226,8 @@ Result open_patched_addon_storage(const NsApplicationContentMetaStatus *dlc,
            apart from the plain one, so do not claim one. */
         log_line("dlc-update-unverifiable dlc=%016llX",
                  (unsigned long long)dlc->application_id);
-        return MAKERESULT(Module_Libnx, LibnxError_NotFound);
+        remember_dlc_update(dlc, patch, false, 0, -1);
+        return not_merged;
     }
 
     /* With no explicit storage FS resolves the DLC through the add-on
@@ -1207,12 +1243,43 @@ Result open_patched_addon_storage(const NsApplicationContentMetaStatus *dlc,
                  (unsigned long long)dlc->application_id, storages[i],
                  result, (long long)size, merged);
         if (merged) {
+            remember_dlc_update(dlc, patch, true, storages[i], size);
             *out = candidate;
             return 0;
         }
         if (R_SUCCEEDED(result)) fsStorageClose(&candidate);
     }
-    return MAKERESULT(Module_Libnx, LibnxError_NotFound);
+    remember_dlc_update(dlc, patch, false, 0, -1);
+    return not_merged;
+}
+
+Result open_patched_addon_storage(const NsApplicationContentMetaStatus *dlc,
+                                  const NsApplicationContentMetaStatus *patch,
+                                  FsStorage *out) {
+    const DlcUpdateDecision *decision = NULL;
+    for (s32 i = 0; i < g_dlc_update_decision_count && !decision; ++i)
+        if (g_dlc_update_decisions[i].dlc_id == dlc->application_id &&
+            g_dlc_update_decisions[i].version == patch->version)
+            decision = &g_dlc_update_decisions[i];
+    if (!decision) return decide_patched_addon_storage(dlc, patch, out);
+    if (!decision->merged)
+        return MAKERESULT(Module_Libnx, LibnxError_NotFound);
+
+    /* Merged before in this export: it must be merged again, or the export
+       would mix two versions of this DLC. */
+    FsStorage storage = {0};
+    Result result = fsOpenDataStorageByDataId(
+        &storage, dlc->application_id, (NcmStorageId)decision->storage);
+    const s64 size = R_SUCCEEDED(result) ? storage_size(&storage) : -1;
+    if (R_SUCCEEDED(result) && size == decision->size) {
+        *out = storage;
+        return 0;
+    }
+    log_line("dlc-update-reopen-failed dlc=%016llX storage=%u result=0x%08x size=%lld expected=%lld",
+             (unsigned long long)dlc->application_id, decision->storage,
+             result, (long long)size, (long long)decision->size);
+    if (R_SUCCEEDED(result)) fsStorageClose(&storage);
+    return MAKERESULT(Module_Libnx, LibnxError_IoError);
 }
 
 static bool result_is_missing_external_key(Result result) {
@@ -1265,6 +1332,63 @@ s32 game_program_indices(u8 *out, s32 capacity) {
     return list_program_indices(
         update ? update : find_program_status(NcmContentMetaType_Application),
         out, capacity);
+}
+
+static u64 program_runtime_id(const NsApplicationContentMetaStatus *status,
+                              int program_index, u8 *out_index);
+
+s32 game_program_folders(u8 *programs, char (*folders)[GAME_FOLDER_SIZE],
+                         s32 capacity) {
+    s32 count = game_program_indices(programs, capacity);
+    if (count <= 1) {
+        if (capacity > 0) {
+            if (count < 1) programs[0] = 0;
+            snprintf(folders[0], GAME_FOLDER_SIZE, "game");
+        }
+        return count < 1 ? 1 : count;
+    }
+
+    const NsApplicationContentMetaStatus *update =
+        find_program_status(NcmContentMetaType_Patch);
+    const NsApplicationContentMetaStatus *status =
+        update ? update : find_program_status(NcmContentMetaType_Application);
+    u8 platform[8] = {0};
+    bool switch1 = false;
+    bool switch2 = false;
+    for (s32 i = 0; i < count && i < 8; ++i) {
+        const u64 id = status ? program_runtime_id(status, programs[i], NULL)
+                              : 0;
+        platform[i] = (u8)(id >> 56);
+        if (platform[i] == 0x01) switch1 = true;
+        if (platform[i] == 0x04) switch2 = true;
+        log_line("game-program index=%u program=%016llX",
+                 programs[i], (unsigned long long)id);
+    }
+
+    /* Switch 2 Editions carry the Switch 1 game (01...) and a separate
+       Switch 2 program (04...), so name them after the platform. Other
+       multi-program titles keep game/ with game/program<N>/. */
+    bool used1 = false;
+    bool used2 = false;
+    for (s32 i = 0; i < count; ++i) {
+        if (switch1 && switch2 && i < 8 && platform[i] == 0x01 && !used1) {
+            snprintf(folders[i], GAME_FOLDER_SIZE, "game_switch1");
+            used1 = true;
+        } else if (switch1 && switch2 && i < 8 && platform[i] == 0x04 &&
+                   !used2) {
+            snprintf(folders[i], GAME_FOLDER_SIZE, "game_switch2");
+            used2 = true;
+        } else if (switch1 && switch2) {
+            snprintf(folders[i], GAME_FOLDER_SIZE, "game_program%u",
+                     programs[i]);
+        } else if (programs[i]) {
+            snprintf(folders[i], GAME_FOLDER_SIZE, "game/program%u",
+                     programs[i]);
+        } else {
+            snprintf(folders[i], GAME_FOLDER_SIZE, "game");
+        }
+    }
+    return count;
 }
 
 typedef struct {
@@ -1438,9 +1562,10 @@ static Result mount_native_title_romfs(u64 application_id,
     if (R_FAILED(result)) return result;
 
     /* Ordinary titles already have a working system location. This route is
-     * specifically for hybrid titles whose selected Program has a native
-     * runtime ID and a non-zero program index. */
-    if (runtime_program_id == application_id || !program_index)
+     * for Programs with a native runtime ID of their own: the Switch 2
+     * program of a Switch 2 Edition (index 1), or a Switch 1 game whose
+     * update replaces its program with a Switch 2 one at index 0. */
+    if (runtime_program_id == application_id)
         return MAKERESULT(Module_Libnx, LibnxError_NotFound);
 
     result = begin_temporary_program_location(
@@ -1449,12 +1574,15 @@ static Result mount_native_title_romfs(u64 application_id,
     if (R_FAILED(result)) return result;
     g_romfs_native_context_active = true;
 
-    result = begin_temporary_program_index_map(
-        &g_romfs_program_index_map, application_id, runtime_program_id,
-        program_index);
-    if (R_FAILED(result)) {
-        end_native_romfs_context();
-        return result;
+    /* Index 0 belongs to the application itself, so it needs no entry. */
+    if (program_index) {
+        result = begin_temporary_program_index_map(
+            &g_romfs_program_index_map, application_id, runtime_program_id,
+            program_index);
+        if (R_FAILED(result)) {
+            end_native_romfs_context();
+            return result;
+        }
     }
 
     FsFileSystem filesystem = {0};
@@ -1464,17 +1592,21 @@ static Result mount_native_title_romfs(u64 application_id,
              (unsigned long long)runtime_program_id, result);
     if (R_FAILED(result) && selected == update && base) {
         /* The fallbacks below open the selected Program on its own. When the
-           base has this Program too, the update's is only the delta on top
-           of it: it can mount, but every file that comes from the base fails
-           to read. A Program the update adds (a Switch 2 Edition's native
-           program) is complete, so it may still be opened alone. */
+           base has this Program too (same program ID), the update's is only
+           the delta on top of it: it can mount, but every file that comes
+           from the base fails to read. A Program the update adds, even at an
+           index the base uses for another program, is complete, so it may
+           still be opened alone. */
         u8 base_programs[8] = {0};
         const s32 base_count = list_program_indices(base, base_programs, 8);
         bool base_has_program = false;
-        for (s32 i = 0; i < base_count; ++i)
-            if (base_programs[i] == program_index) base_has_program = true;
-        log_line("romfs-native-update-program index=%u base-has-program=%u",
-                 program_index, base_has_program);
+        for (s32 i = 0; i < base_count && !base_has_program; ++i)
+            if (program_runtime_id(base, base_programs[i], NULL) ==
+                runtime_program_id)
+                base_has_program = true;
+        log_line("romfs-native-update-program index=%u runtime=%016llX base-has-program=%u",
+                 program_index, (unsigned long long)runtime_program_id,
+                 base_has_program);
         if (base_has_program) {
             log_line("romfs-native-skip-update-only reason=update-romfs-needs-base");
             end_native_romfs_context();
@@ -1880,9 +2012,13 @@ Result open_title_exefs(
             return result;
         }
 
-        result = begin_temporary_program_index_map(
-            &index_map, program_id, runtime_program_id,
-            runtime_program_index);
+        /* Index 0 belongs to the application itself, so it needs no entry
+           (a second index-0 entry would only conflict with it). */
+        result = runtime_program_index
+            ? begin_temporary_program_index_map(
+                  &index_map, program_id, runtime_program_id,
+                  runtime_program_index)
+            : 0;
         if (R_FAILED(result)) {
             Result cleanup_result = end_temporary_program_location(&location);
             if (R_FAILED(cleanup_result))

@@ -57,6 +57,10 @@ typedef struct {
     uint8_t *meta;
     size_t meta_size;
     uint64_t meta_offset;
+    /* Copies of NupMount.control_files; data points into control_data. */
+    NupControlFile *control_files;
+    size_t control_file_count;
+    uint8_t *control_data;
 } PlanPackage;
 
 typedef struct {
@@ -534,6 +538,7 @@ static const struct {
     {"Portuguese", "pt"},            {"Russian", "ru"},
     {"Korean", "ko"},                {"TraditionalChinese", "zh-hant"},
     {"SimplifiedChinese", "zh-hans"}, {"BrazilianPortuguese", "pt-br"},
+    {"Thai", "th"},
 };
 #define NUP_LANGUAGE_COUNT \
     (sizeof(g_nup_languages) / sizeof(g_nup_languages[0]))
@@ -545,65 +550,29 @@ const char *nupLanguageTag(const char *name) {
     return NULL;
 }
 
-static const char *language_name(const uint8_t *tag, size_t length) {
-    for (size_t i = 0; i < NUP_LANGUAGE_COUNT; ++i) {
-        const char *known = g_nup_languages[i].tag;
-        if (strlen(known) != length) continue;
-        size_t at = 0;
-        while (at < length) {
-            char c = (char)tag[at];
-            if (c >= 'A' && c <= 'Z') c += 'a' - 'A';
-            if (c != known[at]) break;
-            ++at;
-        }
-        if (at == length) return g_nup_languages[i].name;
+static Result copy_control_files(PlanPackage *package, const NupMount *view) {
+    if (!view->control_files || !view->control_file_count) return 0;
+    size_t total = 0;
+    for (size_t i = 0; i < view->control_file_count; ++i)
+        total += view->control_files[i].size;
+    package->control_files =
+        calloc(view->control_file_count, sizeof(*package->control_files));
+    package->control_data = total ? malloc(total) : NULL;
+    if (!package->control_files || (total && !package->control_data))
+        return MAKERESULT(Module_Libnx, LibnxError_OutOfMemory);
+    size_t at = 0;
+    for (size_t i = 0; i < view->control_file_count; ++i) {
+        const NupControlFile *file = &view->control_files[i];
+        NupControlFile *copy = &package->control_files[i];
+        memcpy(copy->name, file->name, sizeof(copy->name));
+        copy->name[sizeof(copy->name) - 1] = 0;
+        if (file->size) memcpy(package->control_data + at, file->data, file->size);
+        copy->data = package->control_data + at;
+        copy->size = file->size;
+        at += file->size;
     }
-    return NULL;
-}
-
-size_t nupControlFiles(const void *meta, size_t meta_size,
-                       NupControlFile *files, size_t capacity) {
-    size_t count = 0;
-    const uint8_t *data = NULL;
-    uint32_t size = 0;
-    if (count < capacity &&
-        nupMetaFind(meta, meta_size, NUP_TLV_NACP, &data, &size)) {
-        snprintf(files[count].name, sizeof(files[count].name),
-                 "control.nacp");
-        files[count].data = data;
-        files[count++].size = size;
-    }
-    const size_t icons_start = count;
-    if (nupMetaFind(meta, meta_size, NUP_TLV_LOCALIZED_ICONS, &data, &size)) {
-        size_t at = 0;
-        while (at < size && count < capacity) {
-            const size_t tag_length = data[at];
-            if (at + 1 + tag_length + 4 > size) break;
-            const uint8_t *tag = data + at + 1;
-            const uint8_t *length = tag + tag_length;
-            const uint32_t icon_size = (uint32_t)length[0] |
-                (uint32_t)length[1] << 8 | (uint32_t)length[2] << 16 |
-                (uint32_t)length[3] << 24;
-            const size_t icon_at = at + 1 + tag_length + 4;
-            if (icon_size > size - icon_at) break;
-            const char *name = language_name(tag, tag_length);
-            if (name) {
-                snprintf(files[count].name, sizeof(files[count].name),
-                         "icon_%s.dat", name);
-                files[count].data = data + icon_at;
-                files[count++].size = icon_size;
-            }
-            at = icon_at + icon_size;
-        }
-    }
-    if (count == icons_start && count < capacity &&
-        nupMetaFind(meta, meta_size, NUP_TLV_ICON, &data, &size)) {
-        snprintf(files[count].name, sizeof(files[count].name),
-                 "icon_AmericanEnglish.dat");
-        files[count].data = data;
-        files[count++].size = size;
-    }
-    return count;
+    package->control_file_count = view->control_file_count;
+    return 0;
 }
 
 static void free_plan(Plan *plan) {
@@ -617,8 +586,11 @@ static void free_plan(Plan *plan) {
         free(plan->files[i].name);
         free(plan->files[i].path);
     }
-    for (size_t i = 0; plan->packages && i < plan->package_count; ++i)
+    for (size_t i = 0; plan->packages && i < plan->package_count; ++i) {
         free(plan->packages[i].meta);
+        free(plan->packages[i].control_files);
+        free(plan->packages[i].control_data);
+    }
     free(plan->inputs);
     free(plan->packages);
     free(plan->dirs);
@@ -687,6 +659,8 @@ static Result scan_sources(Plan *plan, const NupInput *inputs,
         }
         if (R_SUCCEEDED(result))
             result = build_package_meta(package, &view);
+        if (R_SUCCEEDED(result))
+            result = copy_control_files(package, &view);
         unmount(mount_user);
         if (R_FAILED(result)) return result;
         if (!view.exefs[0] && !view.exefs_file_count && !view.romfs[0])
@@ -768,9 +742,8 @@ static Result tree_add_memory(NupArchive *archive, const char *path,
 static Result tree_add_control_files(NupArchive *archive,
                                      const PlanPackage *package,
                                      const char *prefix) {
-    NupControlFile files[NUP_MAX_CONTROL_FILES];
-    size_t count = nupControlFiles(package->meta, package->meta_size, files,
-                                   NUP_MAX_CONTROL_FILES);
+    const NupControlFile *files = package->control_files;
+    const size_t count = package->control_file_count;
     Result result = 0;
     for (size_t i = 0; R_SUCCEEDED(result) && i < count; ++i) {
         char path[FS_MAX_PATH];
@@ -849,6 +822,16 @@ static size_t tree_find_index(const NupArchive *archive, const char *path) {
            !strcmp(archive->tree[low].path, path) ? low : SIZE_MAX;
 }
 
+static bool tree_has_editions(const NupArchive *archive) {
+    for (size_t i = 0; i < archive->plan.package_count; ++i) {
+        const NupInput *input = &archive->plan.inputs[i];
+        if (input->layout == NUP_LAYOUT_FOLDER &&
+            !strncmp(input->folder, "game_switch2", 12))
+            return true;
+    }
+    return false;
+}
+
 static Result build_tree(NupArchive *archive) {
     Result result = tree_add(archive, "", true, 0, UINT32_MAX);
     for (size_t i = 0; R_SUCCEEDED(result) && i < archive->plan.package_count;
@@ -862,7 +845,10 @@ static Result build_tree(NupArchive *archive) {
                   input->kind == NUP_KIND_ADDON_UPDATE ? NUP_LAYOUT_DLC
                 : NUP_LAYOUT_BASE;
         }
-        if (layout == NUP_LAYOUT_GAME)
+        if (layout == NUP_LAYOUT_FOLDER && input->folder[0])
+            snprintf(prefix, sizeof(prefix), "%.*s",
+                     (int)sizeof(input->folder), input->folder);
+        else if (layout == NUP_LAYOUT_GAME)
             snprintf(prefix, sizeof(prefix), "game");
         else if (layout == NUP_LAYOUT_GAME_PROGRAM)
             snprintf(prefix, sizeof(prefix), "game/program%u",
@@ -880,10 +866,15 @@ static Result build_tree(NupArchive *archive) {
                 archive, archive->plan.packages[i].root_dir, prefix);
         if (R_SUCCEEDED(result) && (layout == NUP_LAYOUT_GAME ||
                                     layout == NUP_LAYOUT_GAME_PROGRAM ||
+                                    layout == NUP_LAYOUT_FOLDER ||
                                     layout == NUP_LAYOUT_BASE))
             result = tree_add_control_files(
                 archive, &archive->plan.packages[i], prefix);
     }
+    if (R_SUCCEEDED(result) && tree_has_editions(archive))
+        result = tree_add_memory(archive, "README.txt",
+                                 (const uint8_t *)NUP_EDITION_README,
+                                 (uint32_t)strlen(NUP_EDITION_README));
     if (R_FAILED(result)) return result;
 
     qsort(archive->tree, archive->tree_count, sizeof(*archive->tree),
@@ -1512,6 +1503,22 @@ Result nupTreeRead(NupArchive *archive, const char *path, uint64_t offset,
     }
     return read_plan_file(archive, entry->file_index,
                           offset, buffer, size, bytes_read);
+}
+
+bool nupTreeMemoryFile(const NupArchive *archive, size_t index,
+                       const char **path, const uint8_t **data,
+                       uint32_t *size) {
+    if (!archive) return false;
+    for (size_t i = 0; i < archive->tree_count; ++i) {
+        const TreeEntry *entry = &archive->tree[i];
+        if (entry->directory || !entry->data) continue;
+        if (index--) continue;
+        *path = entry->path;
+        *data = entry->data;
+        *size = (uint32_t)entry->size;
+        return true;
+    }
+    return false;
 }
 
 uint64_t nupTreeTotalSize(const NupArchive *archive) {

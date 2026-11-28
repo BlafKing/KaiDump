@@ -622,6 +622,21 @@ void load_details(void) {
              g.control_icon_size);
     g.content_cursor = 0;
     build_content_choices();
+    /* Tell before the dump whether the installed update can be included,
+       so nobody waits for a dump that cannot contain it. */
+    g.update_check = UPDATE_CHECK_NONE;
+    g.update_popup = false;
+    for (s32 i = 0; i < g.choice_count; ++i) {
+        if (g.choices[i].kind != CONTENT_GAME ||
+            g.choices[i].update_index < 0)
+            continue;
+        draw_busy("Checking the installed update",
+                  "Testing whether this game's update can be read...");
+        check_game_update();
+        g.update_popup = g.update_check == UPDATE_CHECK_BASE_ONLY ||
+                         g.update_check == UPDATE_CHECK_FAILS;
+        break;
+    }
     load_selected_icon(app);
     g.screen = SCREEN_DETAILS;
     log_line("details title=%016llX result=0x%08x count=%d",
@@ -672,19 +687,106 @@ static void meta_tlv(MetaBuffer *buffer, uint16_t type, const void *data,
     meta_append(buffer, data, size);
 }
 
-bool build_nup_app_meta(bool include_version, uint8_t **out_meta,
-                        size_t *out_size) {
+static bool build_app_meta(bool include_version, u8 program_index,
+                           uint8_t **out_meta, size_t *out_size,
+                           AppControlFiles *files);
+
+void free_app_control_files(AppControlFiles *files) {
+    free(files->storage);
+    memset(files, 0, sizeof(*files));
+}
+
+/* control.nacp, then every icon the control data has under its own name.
+   Without a per-language icon list (NS route), the one icon is written as
+   the American English one. */
+static void collect_control_files(AppControlFiles *files,
+                                  const NacpStruct *nacp,
+                                  const uint8_t *icon, size_t icon_size) {
+    memset(files, 0, sizeof(*files));
+    const bool icons = !g.icons_disabled;
+    size_t total = nacp ? sizeof(*nacp) : 0;
+    if (icons && g_control_icon_count) {
+        for (int i = 0; i < g_control_icon_count; ++i)
+            total += g_control_icons[i].size;
+    } else if (icons) {
+        total += icon_size;
+    }
+    if (!total) return;
+    files->storage = malloc(total);
+    if (!files->storage) {
+        log_line("control-files-alloc-failed size=%zu", total);
+        return;
+    }
+    size_t at = 0;
+    if (nacp) {
+        NupControlFile *file = &files->files[files->count++];
+        snprintf(file->name, sizeof(file->name), "control.nacp");
+        memcpy(files->storage + at, nacp, sizeof(*nacp));
+        file->data = files->storage + at;
+        file->size = sizeof(*nacp);
+        at += sizeof(*nacp);
+    }
+    for (int i = 0; icons && i < g_control_icon_count &&
+                    files->count < NUP_MAX_CONTROL_FILES; ++i) {
+        NupControlFile *file = &files->files[files->count++];
+        snprintf(file->name, sizeof(file->name), "icon_%.47s.dat",
+                 g_control_icons[i].language);
+        memcpy(files->storage + at, g_control_icons[i].data,
+               g_control_icons[i].size);
+        file->data = files->storage + at;
+        file->size = (uint32_t)g_control_icons[i].size;
+        at += g_control_icons[i].size;
+    }
+    if (icons && !g_control_icon_count && icon_size) {
+        NupControlFile *file = &files->files[files->count++];
+        snprintf(file->name, sizeof(file->name), "icon_AmericanEnglish.dat");
+        memcpy(files->storage + at, icon, icon_size);
+        file->data = files->storage + at;
+        file->size = (uint32_t)icon_size;
+    }
+}
+
+bool build_nup_app_meta(bool include_version, u8 program_index,
+                        uint8_t **out_meta, size_t *out_size,
+                        AppControlFiles *files) {
     *out_meta = NULL;
     *out_size = 0;
+    if (files) memset(files, 0, sizeof(*files));
     if (g.count <= 0) return false;
+    if (!program_index)
+        return build_app_meta(include_version, 0, out_meta, out_size, files);
+
+    /* Another program's control replaces the title and NACP the details
+       screen shows, so keep and restore them. */
+    Application *app = &g.applications[g.selected];
+    char title[sizeof(app->title)];
+    memcpy(title, app->title, sizeof(title));
+    NacpStruct *nacp = malloc(sizeof(*nacp));
+    if (nacp) memcpy(nacp, &g.control_data.nacp, sizeof(*nacp));
+    bool built = build_app_meta(include_version, program_index, out_meta,
+                                out_size, files);
+    memcpy(app->title, title, sizeof(title));
+    if (nacp) {
+        memcpy(&g.control_data.nacp, nacp, sizeof(*nacp));
+        free(nacp);
+    }
+    return built;
+}
+
+static bool build_app_meta(bool include_version, u8 program_index,
+                           uint8_t **out_meta, size_t *out_size,
+                           AppControlFiles *files) {
     Application *app = &g.applications[g.selected];
 
-    /* The content route works for Switch 2 titles; NS for older ones. */
+    /* The content route works for Switch 2 titles; NS for older ones.
+       Switch 2 Editions keep a control per program (id offset). */
     const uint8_t *icon = NULL;
     size_t icon_size = 0;
     bool nacp_valid = false;
     g_capture_control_icons = true;
+    set_control_id_offset(program_index);
     Result result = load_control_from_content(app);
+    set_control_id_offset(0);
     g_capture_control_icons = false;
     if (R_FAILED(result)) free_control_icons();
     if (R_SUCCEEDED(result)) {
@@ -790,13 +892,22 @@ bool build_nup_app_meta(bool include_version, uint8_t **out_meta,
     /* Localized icons: the same record layout, with the image bytes. */
     MetaBuffer localized_icons = {0};
     int icon_languages = 0;
-    for (int i = 0; i < g_control_icon_count; ++i) {
+    for (int i = 0; !g.icons_disabled && i < g_control_icon_count; ++i) {
         const ControlIcon *control_icon = &g_control_icons[i];
+        /* A language without a known tag keeps its name as a BCP-47
+           private-use tag (x-...), so no icon is left out. */
+        char private_tag[64];
         const char *tag = nupLanguageTag(control_icon->language);
         if (!tag) {
-            log_line("nup-meta-icon-skip language=%s reason=unknown-language",
-                     control_icon->language);
-            continue;
+            int at = snprintf(private_tag, sizeof(private_tag), "x-");
+            for (const char *c = control_icon->language;
+                 *c && at < (int)sizeof(private_tag) - 1; ++c)
+                private_tag[at++] = (*c >= 'A' && *c <= 'Z')
+                    ? (char)(*c - 'A' + 'a') : *c;
+            private_tag[at] = 0;
+            tag = private_tag;
+            log_line("nup-meta-icon-private-tag language=%s tag=%s",
+                     control_icon->language, tag);
         }
         const uint8_t tag_length = (uint8_t)strlen(tag);
         const uint32_t length = (uint32_t)control_icon->size;
@@ -815,10 +926,15 @@ bool build_nup_app_meta(bool include_version, uint8_t **out_meta,
                  (uint32_t)localized_icons.size);
     free(localized_icons.data);
 
-    log_line("nup-meta title=%016llX content=0x%08x nacp=%u icon=%zu version=%u languages=%d icons=%d size=%zu failed=%u",
-             (unsigned long long)app->record.application_id, result,
+    log_line("nup-meta title=%016llX program=%u content=0x%08x nacp=%u icon=%zu version=%u languages=%d icons=%d size=%zu failed=%u",
+             (unsigned long long)app->record.application_id, program_index,
+             result,
              nacp_valid, icon_size, include_version && version_length,
              languages, icon_languages, buffer.size, buffer.failed);
+    if (files)
+        collect_control_files(files,
+                              include_version && nacp_valid ? nacp : NULL,
+                              icon, icon_size);
     free_control_icons();
     if (buffer.failed || !buffer.size) {
         free(buffer.data);

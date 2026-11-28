@@ -16,6 +16,9 @@
 #define COLOR_ERROR UI_RGBA(239, 96, 105, 255)
 
 static void format_size(char *output, size_t size, u64 bytes);
+static void draw_wrapped_text(int x, int y, int size, int line_height,
+                              uint32_t color, const char *text,
+                              int max_width, int max_lines);
 
 static void draw_panel(int x, int y, int width, int height) {
     uiFillRoundedRect(x, y, width, height, 14, COLOR_PANEL);
@@ -154,6 +157,66 @@ void draw_loading(void) {
     uiEndFrame();
 }
 
+/* A round badge with "!" centred in it. */
+static void draw_alert_badge(int x, int y, int diameter, uint32_t fill,
+                             uint32_t color) {
+    uiFillRoundedRect(x, y, diameter, diameter, diameter / 2, fill);
+    const int size = diameter / 2;
+    /* Centred by the glyph's advance width and the font size; the old fixed
+       offsets put it about 5 px left of and above the centre. */
+    uiDrawText(x + (diameter - uiTextWidth(size, "!")) / 2,
+               y + (diameter - size) / 2, size, color, "!");
+}
+
+void draw_busy(const char *title, const char *message) {
+    draw_header("Please wait");
+    draw_empty_state(title, message, COLOR_ACCENT);
+    uiEndFrame();
+}
+
+/* Whether the Game choice is selected and its update will not be dumped. */
+static bool update_notice_needed(void) {
+    if (g.update_check != UPDATE_CHECK_BASE_ONLY &&
+        g.update_check != UPDATE_CHECK_FAILS)
+        return false;
+    for (s32 i = 0; i < g.choice_count; ++i)
+        if (g.choices[i].kind == CONTENT_GAME && g.choices[i].selected)
+            return true;
+    return false;
+}
+
+/* The headline and explanation of an update that will not be dumped. */
+static void update_notice(char *title, size_t title_size, char *body,
+                          size_t body_size) {
+    char code[16] = {0};
+    format_result_code(code, sizeof(code), g.update_check_result);
+    const KnownProblem problem = g.update_check == UPDATE_CHECK_BASE_ONLY
+        ? KNOWN_PROBLEM_UPDATE_UNREADABLE
+        : known_problem_for_result(g.update_check_result);
+
+    switch (problem) {
+        case KNOWN_PROBLEM_UPDATE_UNREADABLE:
+            snprintf(title, title_size,
+                     "The update cannot be read: only the base version will be dumped.");
+            break;
+        case KNOWN_PROBLEM_DATA_IN_UPDATE:
+            snprintf(title, title_size,
+                     "This dump will fail: the game's data is only in its update.");
+            break;
+        case KNOWN_PROBLEM_LICENSE:
+            snprintf(title, title_size,
+                     "This dump will fail: the game's license cannot be loaded.");
+            break;
+        default:
+            snprintf(title, title_size,
+                     "This dump will fail: the game cannot be opened (%s).",
+                     code);
+            break;
+    }
+    explain_known_problem(problem, g.update_check_self_matched, body,
+                          body_size);
+}
+
 static void draw_titles(void) {
     load_visible_metadata();
     load_grid_icons();
@@ -274,6 +337,37 @@ static const char *content_choice_name(const ContentChoice *choice) {
     }
 }
 
+/* Opens with the details when the update cannot be dumped, so the user
+   learns it (and how to fix it) before choosing content. */
+static void draw_update_popup(void) {
+    Application *app = &g.applications[g.selected];
+    const bool fails = g.update_check == UPDATE_CHECK_FAILS;
+    const uint32_t accent = fails ? COLOR_ERROR : COLOR_WARNING;
+    char title[160];
+    char body[256];
+    update_notice(title, sizeof(title), body, sizeof(body));
+
+    uiFillRect(0, 0, UI_WIDTH, UI_HEIGHT, UI_RGBA(5, 7, 12, 200));
+    uiFillRoundedRect(240, 186, 800, 348, 18, COLOR_PANEL);
+    uiStrokeRoundedRect(240, 186, 800, 348, 18, 2, accent);
+    draw_alert_badge(272, 218, 56,
+                     fails ? UI_RGBA(89, 39, 47, 255)
+                           : UI_RGBA(83, 67, 34, 255),
+                     accent);
+    uiDrawText(352, 214, 26, COLOR_TEXT,
+               fails ? "This game cannot be dumped right now"
+                     : "The update cannot be dumped");
+    uiDrawTextEllipsized(352, 250, 17, COLOR_MUTED,
+                         app->title[0] ? app->title : "Title unavailable",
+                         660);
+
+    draw_wrapped_text(272, 304, 19, 25, accent, title, 736, 2);
+    draw_wrapped_text(272, 360, 18, 25, COLOR_TEXT, body, 736, 3);
+
+    uiFillRoundedRect(272, 458, 300, 50, 25, COLOR_ACCENT_DARK);
+    uiDrawText(296, 472, 18, COLOR_SUCCESS, "Press A to continue");
+}
+
 static void draw_details(void) {
     Application *app = &g.applications[g.selected];
     draw_header("Title details");
@@ -326,13 +420,26 @@ static void draw_details(void) {
 
             uiDrawText(128, y + 3, 19, COLOR_TEXT,
                        content_choice_name(choice));
-            if (choice->kind == CONTENT_GAME && choice->update_index >= 0) {
+            if (choice->kind == CONTENT_GAME &&
+                g.update_check == UPDATE_CHECK_BASE_ONLY) {
+                uiDrawText(128, y + 28, 14, COLOR_WARNING,
+                           "Update cannot be read: only the base version will be dumped");
+            } else if (choice->kind == CONTENT_GAME &&
+                       g.update_check == UPDATE_CHECK_FAILS) {
+                uiDrawText(128, y + 28, 14, COLOR_ERROR,
+                           "Update cannot be read: this dump will fail");
+            } else if (choice->kind == CONTENT_GAME &&
+                       choice->update_index >= 0) {
                 uiDrawText(128, y + 28, 14, COLOR_MUTED,
                            "Base + installed update");
             } else if (choice->kind == CONTENT_DLC &&
                        choice->update_index >= 0) {
+                /* The update is only merged if FS pairs it with the DLC at
+                   export time, so this states what is installed, not what
+                   the dump will contain. */
                 uiDrawTextf(128, y + 28, 14, COLOR_MUTED,
-                            "DLC + update (v%u)  /  %s",
+                            "Version %u  /  update v%u installed  /  %s",
+                            meta->version,
                             g.meta[choice->update_index].version,
                             storage_name(meta->storageID));
             } else if (choice->kind == CONTENT_BASE) {
@@ -368,6 +475,7 @@ static void draw_details(void) {
     draw_footer("D-Pad", "Select", "A", "Select", "X", "Continue",
                 "B", "Titles");
     draw_exit_hint();
+    if (g.update_popup) draw_update_popup();
     uiEndFrame();
 }
 
@@ -435,23 +543,33 @@ static void draw_output(void) {
         : g.output_format == OUTPUT_TAR
             ? "One uncompressed archive, prepared without hashing content."
             : "One unencrypted NX package containing the selected content.";
-    draw_option_row(250, "Format", output_format_name(), format_description,
+    draw_option_row(230, "Format", output_format_name(), format_description,
                     g.output_cursor == 0, 0, 0);
     bool ftp_unavailable = g.ftp_enabled && !g.ftp_available;
-    draw_option_row(360, "Destination", destination,
+    draw_option_row(330, "Destination", destination,
                     destination_description,
                     g.output_cursor == 1,
                     ftp_unavailable ? COLOR_ERROR : 0,
                     ftp_unavailable ? COLOR_ERROR : 0);
+    const char *icons_description = g.output_format == OUTPUT_NUP
+        ? (g.icons_disabled
+               ? "Only the main icon is stored in the NUP."
+               : "Store the game's icon for every language in the NUP.")
+        : (g.icons_disabled
+               ? "Only control.nacp is placed next to the game files."
+               : "Place icon_<Language>.dat files next to the game files.");
+    draw_option_row(430, "Game icons",
+                    g.icons_disabled ? "Off" : "Included",
+                    icons_description, g.output_cursor == 2, 0, 0);
     if (g.output_format == OUTPUT_NUP && (g.ftp_enabled || g.usb_enabled))
-        uiDrawText(278, 482, 15, COLOR_MUTED,
+        uiDrawText(278, 542, 15, COLOR_MUTED,
                    "Virtual output requires one hashing pass before transfer begins.");
     else if (g.output_format == OUTPUT_TAR && (g.ftp_enabled || g.usb_enabled))
-        uiDrawText(278, 482, 15, COLOR_MUTED,
+        uiDrawText(278, 542, 15, COLOR_MUTED,
                    "TAR is available after a quick file inventory; no hash pass needed.");
     else if (g.output_format == OUTPUT_EXTRACTED &&
              (g.ftp_enabled || g.usb_enabled))
-        uiDrawText(278, 482, 15, COLOR_MUTED,
+        uiDrawText(278, 542, 15, COLOR_MUTED,
                    "Files are read directly from the selected game content.");
 
     draw_footer("D-Pad", "Select", "A / Left / Right", "Change",
@@ -464,8 +582,7 @@ static void draw_confirm(void) {
     Application *app = &g.applications[g.selected];
     draw_header("Confirm dump");
     draw_panel(218, 137, 844, 462);
-    uiFillRoundedRect(250, 169, 56, 56, 28, UI_RGBA(83, 67, 34, 255));
-    uiDrawText(270, 179, 28, COLOR_WARNING, "!");
+    draw_alert_badge(250, 169, 56, UI_RGBA(83, 67, 34, 255), COLOR_WARNING);
     uiDrawText(330, 164, 28, COLOR_TEXT, "Start this export?");
     uiDrawTextEllipsized(330, 201, 18, COLOR_MUTED,
                          app->title[0] ? app->title : "Title unavailable", 680);
@@ -509,16 +626,32 @@ static void draw_confirm(void) {
                              output_path, 736);
     }
 
-    uiDrawText(250, 400, 19, COLOR_TEXT,
-               "Existing files with matching names will be replaced.");
-    uiDrawText(250, 434, 18, COLOR_MUTED,
-               "KaiDump never writes to game content or NAND.");
-    uiDrawText(250, 464, 18, COLOR_MUTED,
-               g.ftp_enabled
-                   ? "The selected content remains mounted while FTP is running."
-                   : g.usb_enabled
-                       ? "The selected content remains mounted while USB is running."
-                   : "Make sure the SD card has enough free space.");
+    if (update_notice_needed()) {
+        /* Known before the dump starts, so the user can decide now. */
+        char title[160];
+        char body[256];
+        update_notice(title, sizeof(title), body, sizeof(body));
+        const bool fails = g.update_check == UPDATE_CHECK_FAILS;
+        uiDrawText(250, 392, 17, COLOR_TEXT,
+                   "Existing files with matching names will be replaced.");
+        uiFillRoundedRect(250, 420, 780, 84, 9, COLOR_BACKGROUND);
+        uiFillRoundedRect(250, 420, 6, 84, 3,
+                          fails ? COLOR_ERROR : COLOR_WARNING);
+        uiDrawTextEllipsized(270, 430, 17, fails ? COLOR_ERROR : COLOR_WARNING,
+                             title, 744);
+        draw_wrapped_text(270, 456, 16, 21, COLOR_MUTED, body, 744, 2);
+    } else {
+        uiDrawText(250, 400, 19, COLOR_TEXT,
+                   "Existing files with matching names will be replaced.");
+        uiDrawText(250, 434, 18, COLOR_MUTED,
+                   "KaiDump never writes to game content or NAND.");
+        uiDrawText(250, 464, 18, COLOR_MUTED,
+                   g.ftp_enabled
+                       ? "The selected content remains mounted while FTP is running."
+                       : g.usb_enabled
+                           ? "The selected content remains mounted while USB is running."
+                       : "Make sure the SD card has enough free space.");
+    }
 
     uiFillRoundedRect(250, 514, 512, 54, 27, COLOR_ACCENT_DARK);
     uiDrawText(274, 530, 18, COLOR_SUCCESS,
@@ -614,6 +747,47 @@ static void format_size(char *output, size_t size, u64 bytes) {
     else snprintf(output, size, "%.2f %s", value, units[unit]);
 }
 
+/* Draws text word-wrapped to max_width, on at most max_lines lines; the
+   last line is shortened with an ellipsis if the text does not fit. */
+static void draw_wrapped_text(int x, int y, int size, int line_height,
+                              uint32_t color, const char *text,
+                              int max_width, int max_lines) {
+    const char *at = text;
+    for (int line = 0; line < max_lines && *at; ++line) {
+        while (*at == ' ') ++at;
+        if (line == max_lines - 1) {
+            uiDrawTextEllipsized(x, y + line * line_height, size, color, at,
+                                 max_width);
+            return;
+        }
+        /* The longest run of whole words that fits. */
+        char buffer[512];
+        size_t fit = 0;
+        size_t length = 0;
+        while (at[length]) {
+            size_t next = length;
+            while (at[next] == ' ') ++next;
+            while (at[next] && at[next] != ' ') ++next;
+            if (next >= sizeof(buffer)) break;
+            memcpy(buffer, at, next);
+            buffer[next] = 0;
+            if (uiTextWidth(size, buffer) > max_width) break;
+            fit = next;
+            length = next;
+        }
+        if (!fit) {
+            /* One word wider than the line: let the last line clip it. */
+            uiDrawTextEllipsized(x, y + line * line_height, size, color, at,
+                                 max_width);
+            return;
+        }
+        memcpy(buffer, at, fit);
+        buffer[fit] = 0;
+        uiDrawText(x, y + line * line_height, size, color, buffer);
+        at += fit;
+    }
+}
+
 static void draw_result(void) {
     draw_header("Dump result");
     bool succeeded = R_SUCCEEDED(g.dump_result);
@@ -626,24 +800,26 @@ static void draw_result(void) {
     uiDrawText(250, 225, 31, COLOR_TEXT, succeeded ? "Dump completed"
                : (cancelled ? "Dump cancelled" : "Dump did not complete"));
     if (g.status[0])
-        uiDrawTextEllipsized(250, 272, 19, COLOR_MUTED, g.status, 760);
+        /* Up to four lines: explanations of known problems say why and
+           what to do instead of only pointing at the log. */
+        draw_wrapped_text(250, 264, 18, 24, COLOR_MUTED, g.status, 780, 4);
 
     char bytes[48];
     format_size(bytes, sizeof(bytes), g.copied_bytes);
-    uiFillRoundedRect(250, 330, 370, 106, 12, COLOR_PANEL_LIGHT);
-    uiDrawText(274, 350, 16, COLOR_MUTED,
+    uiFillRoundedRect(250, 368, 370, 106, 12, COLOR_PANEL_LIGHT);
+    uiDrawText(274, 388, 16, COLOR_MUTED,
                g.progress_files_label[0]
                    ? g.progress_files_label : "FILES COPIED");
-    uiDrawTextf(274, 382, 29, COLOR_TEXT, "%llu",
+    uiDrawTextf(274, 420, 29, COLOR_TEXT, "%llu",
                 (unsigned long long)g.copied_files);
-    uiFillRoundedRect(650, 330, 380, 106, 12, COLOR_PANEL_LIGHT);
-    uiDrawText(674, 350, 16, COLOR_MUTED,
+    uiFillRoundedRect(650, 368, 380, 106, 12, COLOR_PANEL_LIGHT);
+    uiDrawText(674, 388, 16, COLOR_MUTED,
                g.progress_bytes_label[0]
                    ? g.progress_bytes_label : "DATA COPIED");
-    uiDrawText(674, 382, 29, COLOR_TEXT, bytes);
+    uiDrawText(674, 420, 29, COLOR_TEXT, bytes);
 
     if (!succeeded)
-        uiDrawTextf(250, 482, 16, COLOR_SUBTLE,
+        uiDrawTextf(250, 504, 16, COLOR_SUBTLE,
                     "Result 0x%08x  /  module %u  /  description %u",
                     g.dump_result, R_MODULE(g.dump_result),
                     R_DESCRIPTION(g.dump_result));
@@ -840,6 +1016,10 @@ bool handle_input(u64 down, PadState *pad) {
             if (g.selected >= g.count) g.selected = g.count - 1;
             if (old == g.selected) return true;
         }
+    } else if (g.screen == SCREEN_DETAILS && g.update_popup) {
+        /* Only A closes the notice, so it cannot be skipped by accident. */
+        if (down & HidNpadButton_A) g.update_popup = false;
+        else return true;
     } else if (g.screen == SCREEN_DETAILS) {
         if (down & HidNpadButton_B) {
             uiClearImage();
@@ -876,12 +1056,14 @@ bool handle_input(u64 down, PadState *pad) {
                 g.screen = SCREEN_CONFIRM;
             }
         } else if (down & HidNpadButton_AnyUp) {
-            g.output_cursor = 0;
+            if (g.output_cursor > 0) --g.output_cursor;
         } else if (down & HidNpadButton_AnyDown) {
-            g.output_cursor = 1;
+            if (g.output_cursor < 2) ++g.output_cursor;
         } else if (down & (HidNpadButton_A | HidNpadButton_AnyLeft |
                            HidNpadButton_AnyRight)) {
-            if (g.output_cursor == 0) {
+            if (g.output_cursor == 2) {
+                g.icons_disabled = !g.icons_disabled;
+            } else if (g.output_cursor == 0) {
                 if (down & HidNpadButton_AnyLeft)
                     g.output_format = (g.output_format + OUTPUT_FORMAT_COUNT - 1) %
                                       OUTPUT_FORMAT_COUNT;

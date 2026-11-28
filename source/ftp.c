@@ -671,7 +671,15 @@ static void serve_client(int client, struct in_addr ip, FtpWorker *worker,
             else if (!strcmp(line, "CLNT")) reply(client, "200 Client noted\r\n");
             else if (!strcmp(line, "NOOP")) reply(client, "200 OK\r\n");
             else if (!strcmp(line, "PWD")) reply(client, "257 \"/\"\r\n");
-            else if (!strcmp(line, "CWD")) reply(client, "250 Directory changed\r\n");
+            else if (!strcmp(line, "CWD")) {
+                /* The only directory is the root. Accepting CWD into the
+                   file makes clients such as KDE Dolphin (kio_ftp) treat
+                   the archive as an empty folder and never download it. */
+                const char *at = argument;
+                while (*at == '/' || *at == '.') ++at;
+                reply(client, *at ? "550 Not a directory\r\n"
+                                  : "250 Directory changed\r\n");
+            }
             else if (!strcmp(line, "CDUP")) reply(client, "250 Directory changed\r\n");
             else if (!strcmp(line, "FEAT"))
                 reply(client, "211-Features\r\n EPSV\r\n PASV\r\n MDTM\r\n MLST type*;size*;perm*;\r\n REST STREAM\r\n SIZE\r\n UTF8\r\n211 End\r\n");

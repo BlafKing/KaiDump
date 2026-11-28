@@ -120,9 +120,14 @@ static Result mount_nup_romfs_status(
                 *merged_update = update;
                 return 0;
             }
+            /* Every mount of this source must give the same content (see
+               open_patched_addon_storage), so do not switch versions. */
             fsStorageClose(&storage);
-            storage = (FsStorage){0};
+            return mount_result;
         }
+        if (R_VALUE(result) !=
+            R_VALUE(MAKERESULT(Module_Libnx, LibnxError_NotFound)))
+            return result;
         log_line("dlc-update-warning not-included: the DLC update could not be merged; exporting the DLC without it");
         g.dlc_update_missing = true;
     }
@@ -175,113 +180,115 @@ static Result mount_nup_romfs_status(
     return prefer_romfs_failure(storage_failure, result);
 }
 
-/* Application metadata, built once per export: NUP meta TLVs, and the
-   control.nacp / icon files of extracted and TAR output. The "full" variant
-   (with NACP and display version) describes the game as exported; a base
-   exported without its installed update gets the other, so a 1.0.0 dump
-   never carries the update's version. */
-static uint8_t *g_nup_meta[2];
-static size_t g_nup_meta_size[2];
-static bool g_nup_meta_built[2];
+/* Application metadata, built once per export and program: NUP meta TLVs,
+   and the control.nacp / icon files of extracted and TAR output. The "full"
+   variant (with NACP and display version) describes the game as exported;
+   a base exported without its installed update gets the other, so a 1.0.0
+   dump never carries the update's version. Switch 2 Editions have a control
+   per program, hence one cache per program index. */
+#define META_PROGRAMS 8
+static uint8_t *g_nup_meta[2][META_PROGRAMS];
+static size_t g_nup_meta_size[2][META_PROGRAMS];
+static AppControlFiles g_app_files[2][META_PROGRAMS];
+static bool g_nup_meta_built[2][META_PROGRAMS];
 
 static void free_nup_meta(void) {
     for (int i = 0; i < 2; ++i) {
-        free(g_nup_meta[i]);
-        g_nup_meta[i] = NULL;
-        g_nup_meta_size[i] = 0;
-        g_nup_meta_built[i] = false;
+        for (int p = 0; p < META_PROGRAMS; ++p) {
+            free(g_nup_meta[i][p]);
+            g_nup_meta[i][p] = NULL;
+            g_nup_meta_size[i][p] = 0;
+            free_app_control_files(&g_app_files[i][p]);
+            g_nup_meta_built[i][p] = false;
+        }
     }
 }
 
+typedef struct {
+    const uint8_t *meta;
+    size_t meta_size;
+    const AppControlFiles *files;
+} AppMeta;
+
 static bool select_app_meta(const ContentChoice *choice, bool base_only,
-                            const uint8_t **meta, size_t *meta_size) {
-    *meta = NULL;
-    *meta_size = 0;
+                            u8 program_index, AppMeta *out) {
+    memset(out, 0, sizeof(*out));
     if (choice->kind != CONTENT_GAME && choice->kind != CONTENT_BASE)
         return false;
+    if (program_index == PROGRAM_INDEX_AUTO) program_index = 0;
+    if (program_index >= META_PROGRAMS) return false;
     const int full = !find_program_status(NcmContentMetaType_Patch) ||
                      (choice->kind == CONTENT_GAME && !base_only);
-    if (!g_nup_meta_built[full]) {
-        g_nup_meta_built[full] = true;
-        build_nup_app_meta(full, &g_nup_meta[full], &g_nup_meta_size[full]);
+    if (!g_nup_meta_built[full][program_index]) {
+        g_nup_meta_built[full][program_index] = true;
+        build_nup_app_meta(full, program_index,
+                           &g_nup_meta[full][program_index],
+                           &g_nup_meta_size[full][program_index],
+                           &g_app_files[full][program_index]);
     }
-    *meta = g_nup_meta[full];
-    *meta_size = g_nup_meta_size[full];
-    return *meta != NULL;
+    out->meta = g_nup_meta[full][program_index];
+    out->meta_size = g_nup_meta_size[full][program_index];
+    out->files = &g_app_files[full][program_index];
+    return true;
 }
 
 static void attach_nup_meta(const NupInput *input, const ContentChoice *choice,
                             bool base_only, NupMount *mount) {
     /* A NUP carries one game: extra programs are not packed (see
-       build_nup_inputs), and extracted output gets the files per program. */
+       build_nup_inputs). Extracted and TAR output get the files of each
+       program's own control instead of meta TLVs. */
     if (g.output_format == OUTPUT_NUP &&
         input->program_index != PROGRAM_INDEX_AUTO && input->program_index)
         return;
-    const uint8_t *meta = NULL;
-    size_t meta_size = 0;
-    if (select_app_meta(choice, base_only, &meta, &meta_size)) {
-        mount->meta = meta;
-        mount->meta_size = meta_size;
-    }
-}
-
-static Result write_memory_file(const char *path, const uint8_t *data,
-                                uint32_t size) {
-    FILE *file = fopen(path, "wb");
-    if (!file) return MAKERESULT(Module_Libnx, LibnxError_IoError);
-    bool ok = fwrite(data, 1, size, file) == size;
-    if (fclose(file) != 0) ok = false;
-    if (ok) {
-        g.copied_bytes += size;
-        ++g.copied_files;
-    }
-    return ok ? 0 : MAKERESULT(Module_Libnx, LibnxError_IoError);
-}
-
-/* Extracted to SD: the same control.nacp and icon files that the tree adds
-   for FTP, USB and TAR (see tree_add_control_files in nup.c). */
-static void write_control_files(const char *package, const ContentChoice *choice,
-                                bool base_only) {
-    const uint8_t *meta = NULL;
-    size_t meta_size = 0;
-    if (!select_app_meta(choice, base_only, &meta, &meta_size)) return;
-    NupControlFile files[NUP_MAX_CONTROL_FILES];
-    size_t count = nupControlFiles(meta, meta_size, files,
-                                   NUP_MAX_CONTROL_FILES);
-    size_t failed = 0;
-    for (size_t i = 0; i < count; ++i) {
-        char path[640];
-        const int length = snprintf(path, sizeof(path), "%s/%s", package,
-                                    files[i].name);
-        if (length < 0 || (size_t)length >= sizeof(path) ||
-            R_FAILED(write_memory_file(path, files[i].data, files[i].size)))
-            ++failed;
-    }
-    log_line("control-files package=%s files=%zu failed=%zu", package, count,
-             failed);
-}
-
-static void write_selected_control_files(const char *root,
-                                         const ContentChoice *choice,
-                                         bool base_only) {
-    char package[512];
-    if (choice->kind == CONTENT_BASE) {
-        snprintf(package, sizeof(package), "%s/base", root);
-        write_control_files(package, choice, base_only);
+    AppMeta app = {0};
+    if (!select_app_meta(choice, base_only, input->program_index, &app))
         return;
+    if (g.output_format == OUTPUT_NUP) {
+        mount->meta = app.meta;
+        mount->meta_size = app.meta_size;
+    } else {
+        mount->control_files = app.files->files;
+        mount->control_file_count = app.files->count;
     }
-    if (choice->kind != CONTENT_GAME) return;
-    snprintf(package, sizeof(package), "%s/game", root);
-    write_control_files(package, choice, base_only);
-    /* Switch 2 Editions: every program shares the application's control. */
-    u8 programs[8] = {0};
-    s32 program_count = game_program_indices(programs, 8);
-    for (s32 i = 0; i < program_count; ++i) {
-        if (!programs[i]) continue;
-        snprintf(package, sizeof(package), "%s/game/program%u", root,
-                 programs[i]);
-        write_control_files(package, choice, base_only);
+}
+
+/* Extracted to SD: writes the files that exist only in the export tree
+   (control.nacp, icons, README.txt) next to the copied game files. */
+static void write_tree_memory_files(const char *root, NupArchive *tree) {
+    size_t written = 0;
+    size_t failed = 0;
+    const char *relative = NULL;
+    const uint8_t *data = NULL;
+    uint32_t size = 0;
+    for (size_t i = 0;
+         nupTreeMemoryFile(tree, i, &relative, &data, &size); ++i) {
+        char path[640];
+        const int length = snprintf(path, sizeof(path), "%s/%s", root,
+                                    relative);
+        FILE *file = NULL;
+        bool ok = length > 0 && (size_t)length < sizeof(path);
+        if (ok) {
+            char parent[640];
+            snprintf(parent, sizeof(parent), "%s", path);
+            char *slash = strrchr(parent, '/');
+            if (slash) *slash = 0;
+            ok = ensure_directory(parent) == 0;
+        }
+        if (ok) file = fopen(path, "wb");
+        ok = file && fwrite(data, 1, size, file) == size;
+        if (file && fclose(file) != 0) ok = false;
+        if (ok) {
+            g.copied_bytes += size;
+            ++g.copied_files;
+            ++written;
+        } else {
+            ++failed;
+            log_line("tree-memory-file-failed path=%s errno=%d", relative,
+                     errno);
+        }
     }
+    log_line("tree-memory-files root=%s written=%zu failed=%zu", root,
+             written, failed);
 }
 
 static Result mount_nup_source(const NupInput *input, NupMount *mount,
@@ -452,23 +459,28 @@ static size_t build_nup_inputs(NupInput *inputs, size_t capacity) {
             input->kind = NUP_KIND_BASE;
             input->layout = NUP_LAYOUT_GAME;
 
-            /* Switch 2 Editions: the original game (program 0) goes in
-               game/, every other program in game/program<N>/. */
+            /* Multi-program titles: one input per program, each in its own
+               folder (game_switch1/ + game_switch2/ for Switch 2 Editions,
+               see game_program_folders). */
             u8 programs[8] = {0};
-            s32 program_count = game_program_indices(programs, 8);
+            char folders[8][GAME_FOLDER_SIZE] = {{0}};
+            s32 program_count = game_program_folders(programs, folders, 8);
             if (program_count > 1) {
                 const NupInput game = *input;
                 for (s32 p = 0; p < program_count && count < capacity; ++p) {
                     if (programs[p] && g.output_format == OUTPUT_NUP) {
-                        /* The NUP format has no program index yet. */
+                        /* NUP v1 holds one base package: the Switch 1
+                           version (program 0), which is always complete. */
                         log_line("nup-input-skip-program index=%u",
                                  programs[p]);
                         continue;
                     }
                     inputs[count] = game;
                     inputs[count].program_index = programs[p];
-                    inputs[count].layout = programs[p]
-                        ? NUP_LAYOUT_GAME_PROGRAM : NUP_LAYOUT_GAME;
+                    inputs[count].layout = NUP_LAYOUT_FOLDER;
+                    memcpy(inputs[count].folder, folders[p],
+                           sizeof(inputs[count].folder));
+                    inputs[count].folder[sizeof(inputs[count].folder) - 1] = 0;
                     ++count;
                 }
                 continue;
@@ -915,9 +927,40 @@ static Result serve_selected_tar_usb(PadState *pad) {
     return result;
 }
 
-static bool is_switch2_title(u64 application_id) {
-    return (application_id & 0xffff000000000000ULL) ==
-           0x0400000000000000ULL;
+KnownProblem known_problem_for_result(Result result) {
+    if (result_is_data_in_update(result)) return KNOWN_PROBLEM_DATA_IN_UPDATE;
+    if (R_VALUE(result) == 0x7d802) return KNOWN_PROBLEM_LICENSE;
+    return KNOWN_PROBLEM_UNKNOWN;
+}
+
+void explain_known_problem(KnownProblem problem, bool self_matched,
+                           char *out, size_t size) {
+    if (problem == KNOWN_PROBLEM_UNKNOWN) {
+        snprintf(out, size,
+                 "This is not a known limitation, so please report it and include KaiDump.log.");
+        return;
+    }
+    const char *cause =
+        problem == KNOWN_PROBLEM_UPDATE_UNREADABLE
+            ? "The console only applies an update while its game is running."
+        : problem == KNOWN_PROBLEM_DATA_IN_UPDATE
+            ? "The installed base version is incomplete without its update."
+            : "This game's license can only be loaded while the game is running.";
+    const u64 application_id = g.count > 0
+        ? g.applications[g.selected].record.application_id : 0;
+    if (!is_switch2_title(application_id))
+        snprintf(out, size,
+                 "%s kaiHEN cannot run KaiDump inside Switch 1 games yet: a known limitation that KaiDump cannot fix, so there is no need to report it.",
+                 cause);
+    else if (!self_matched)
+        snprintf(out, size,
+                 "%s To %s, start kaiHEN through this game, then open KaiDump from the same hbmenu session.",
+                 cause,
+                 problem == KNOWN_PROBLEM_UPDATE_UNREADABLE
+                     ? "include the update" : "dump it");
+    else
+        snprintf(out, size,
+                 "This should work with kaiHEN started through this game, so please report it and include KaiDump.log.");
 }
 
 void dump_title(PadState *pad) {
@@ -934,13 +977,15 @@ void dump_title(PadState *pad) {
     g.exefs_base_only = false;
     g.romfs_self_matched = false;
     g.dlc_update_missing = false;
+    reset_dlc_update_decisions();
 
-    log_line("export-start title=%016llX name=%s mode=%s destination=%s choices=%d selected=%d",
+    log_line("export-start title=%016llX name=%s mode=%s destination=%s icons=%u choices=%d selected=%d",
              (unsigned long long)app->record.application_id,
              app->title[0] ? app->title : "(unavailable)",
              g.output_format == OUTPUT_NUP ? "nup"
                  : g.output_format == OUTPUT_TAR ? "tar" : "extracted",
              g.usb_enabled ? "usb" : g.ftp_enabled ? "ftp" : "sd",
+             g.icons_disabled ? 0 : 1,
              g.choice_count,
              selected_content_count());
     for (s32 i = 0; i < g.choice_count; ++i) {
@@ -1022,28 +1067,26 @@ void dump_title(PadState *pad) {
             "Inventorying extracted files...");
         if (R_SUCCEEDED(g.dump_result)) {
             g.progress_total_bytes = nupTreeTotalSize(measure_tree);
-            nupArchiveClose(measure_tree);
+            nupArchiveDeactivate(measure_tree);
             g.copied_bytes = 0;
             g.copied_files = 0;
             draw_progress("Starting extracted copy...");
             for (s32 i = 0; i < g.choice_count; ++i) {
                 ContentChoice *choice = &g.choices[i];
                 if (!choice->selected) continue;
-                const bool was_base_only = g.romfs_base_only;
-                g.romfs_base_only = false;
                 Result result = choice->kind == CONTENT_GAME
                     ? export_combined_game(app->record.application_id, root, pad)
                     : export_selected_content(&g.meta[choice->meta_index], root, pad);
-                const bool base_only = g.romfs_base_only;
-                g.romfs_base_only = was_base_only || base_only;
                 if (R_FAILED(result)) {
                     g.dump_result = result;
                     break;
                 }
-                write_selected_control_files(root, choice, base_only);
                 ++completed;
             }
+            if (R_SUCCEEDED(g.dump_result))
+                write_tree_memory_files(root, measure_tree);
         }
+        nupArchiveClose(measure_tree);
     }
     g.progress_active = false;
     if (R_SUCCEEDED(g.dump_result)) {
@@ -1055,21 +1098,17 @@ void dump_title(PadState *pad) {
                              ? "%d selected content package%s archived as TAR"
                              : "%d selected content package%s exported successfully",
                      completed, completed == 1 ? "" : "s");
-        if (g.romfs_base_only && g.exefs_base_only)
+        if (g.romfs_base_only || g.exefs_base_only) {
+            char explanation[224];
+            explain_known_problem(KNOWN_PROBLEM_UPDATE_UNREADABLE,
+                                  g.romfs_self_matched, explanation,
+                                  sizeof(explanation));
             snprintf(g.status, sizeof(g.status),
-                     is_switch2_title(app->record.application_id) &&
-                             !g.romfs_self_matched
-                         ? "Update unavailable, so the base version was exported. Launch kaiHEN through this game to include it"
-                         : "Warning: the update could not be opened, so the base version was exported (see KaiDump.log)");
-        else if (g.romfs_base_only)
+                     "Only the base version was exported. %s", explanation);
+        } else if (g.dlc_update_missing) {
             snprintf(g.status, sizeof(g.status),
-                     "Warning: the update's RomFS was unavailable, so the base version was used (see KaiDump.log)");
-        else if (g.exefs_base_only)
-            snprintf(g.status, sizeof(g.status),
-                     "Warning: the update's ExeFS was unavailable, so the base ExeFS was used (see KaiDump.log)");
-        else if (g.dlc_update_missing)
-            snprintf(g.status, sizeof(g.status),
-                     "Warning: a DLC update could not be merged, so that DLC was exported without it (see KaiDump.log)");
+                     "Some DLC was exported without its DLC update. The console only applies DLC updates for a running game, so they usually cannot be included yet: a known limitation, so there is no need to report it.");
+        }
     } else if (R_MODULE(g.dump_result) == Module_Libnx &&
                R_DESCRIPTION(g.dump_result) == KAIDUMP_ERROR_CANCELED) {
         snprintf(g.status, sizeof(g.status),
@@ -1091,23 +1130,26 @@ void dump_title(PadState *pad) {
     } else {
         char code[16];
         format_result_code(code, sizeof(code), g.dump_result);
-        if (R_VALUE(g.dump_result) == 0x7d802) {
-            if (is_switch2_title(app->record.application_id) &&
-                !g.romfs_self_matched) {
-                snprintf(g.status, sizeof(g.status),
-                         "Dump failed. Try launching kaiHEN through the game you are trying to dump, then open KaiDump and retry (%s)",
-                         code);
-                log_line("export-retry-hint title=%016llX reason=NcaExternalKeyNotFound switch2=1 self-match=0",
-                         (unsigned long long)app->record.application_id);
-            } else if (g.romfs_self_matched) {
-                snprintf(g.status, sizeof(g.status),
-                         "Content key unavailable (%s) even inside the game; see KaiDump.log",
-                         code);
-            } else {
-                snprintf(g.status, sizeof(g.status),
-                         "Content key unavailable (%s); see KaiDump.log",
-                         code);
-            }
+        const KnownProblem problem =
+            known_problem_for_result(g.dump_result);
+        if ((problem == KNOWN_PROBLEM_DATA_IN_UPDATE &&
+             find_program_status(NcmContentMetaType_Patch)) ||
+            problem == KNOWN_PROBLEM_LICENSE) {
+            /* Expected: the base is incomplete without its unreadable
+               update (Hogwarts Legacy, Dave the Diver), or the game's
+               license only loads while it runs. Say why, not "see log". */
+            char explanation[224];
+            explain_known_problem(problem, g.romfs_self_matched,
+                                  explanation, sizeof(explanation));
+            snprintf(g.status, sizeof(g.status),
+                     "This game could not be dumped (%s). %s", code,
+                     explanation);
+            log_line("export-retry-hint title=%016llX reason=%s switch2=%u self-match=%u",
+                     (unsigned long long)app->record.application_id,
+                     problem == KNOWN_PROBLEM_LICENSE ? "license"
+                                                      : "data-in-update",
+                     is_switch2_title(app->record.application_id),
+                     g.romfs_self_matched);
         } else if (g_ftp_server_failed) {
             snprintf(g.status, sizeof(g.status),
                      g.ftp_address[0]

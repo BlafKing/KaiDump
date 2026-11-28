@@ -259,9 +259,14 @@ static Result copy_selected_romfs(
                 romfsUnmount("kdrom");
                 return result;
             }
+            /* The export was sized for the merged DLC (see
+               open_patched_addon_storage), so do not switch versions. */
             fsStorageClose(&storage);
-            storage = (FsStorage){0};
+            return result;
         }
+        if (R_VALUE(result) !=
+            R_VALUE(MAKERESULT(Module_Libnx, LibnxError_NotFound)))
+            return result;
         log_line("dlc-update-warning not-included: the DLC update could not be merged; exporting the DLC without it");
         g.dlc_update_missing = true;
     }
@@ -421,25 +426,113 @@ static Result export_combined_program(u64 application_id,
     return result;
 }
 
+/* The update half of export_combined_program, without copying: opens its
+   RomFS and ExeFS the same way and reports what the dump would contain. */
+static UpdateCheck probe_program_update(u64 application_id,
+                                        Result *out_result) {
+    const NsApplicationContentMetaStatus *base =
+        find_program_status(NcmContentMetaType_Application);
+    const NsApplicationContentMetaStatus *update =
+        find_program_status(NcmContentMetaType_Patch);
+    *out_result = 0;
+
+    g.romfs_base_only = false;
+    bool romfs_device = false;
+    Result romfs_result = mount_title_romfs(application_id, &romfs_device);
+    const bool romfs_base_only =
+        R_SUCCEEDED(romfs_result) && g.romfs_base_only;
+    if (R_SUCCEEDED(romfs_result))
+        unmount_title_romfs("kdrom", romfs_device);
+    if (R_FAILED(romfs_result)) {
+        *out_result = romfs_result;
+        return UPDATE_CHECK_FAILS;
+    }
+    if (romfs_base_only) return UPDATE_CHECK_BASE_ONLY;
+
+    FsFileSystem exefs = {0};
+    Result exefs_result = open_title_exefs(&exefs, application_id, update,
+                                           base);
+    if (R_SUCCEEDED(exefs_result)) {
+        close_code_filesystem(&exefs);
+        return UPDATE_CHECK_INCLUDED;
+    }
+    /* The export then uses the base ExeFS and, to match it, the base
+       RomFS, which must open on its own. */
+    *out_result = exefs_result;
+    romfs_device = false;
+    romfs_result = mount_base_title_romfs(application_id, &romfs_device);
+    if (R_FAILED(romfs_result)) {
+        *out_result = romfs_result;
+        return UPDATE_CHECK_FAILS;
+    }
+    unmount_title_romfs("kdrom", romfs_device);
+    return UPDATE_CHECK_BASE_ONLY;
+}
+
+void check_game_update(void) {
+    g.update_check = UPDATE_CHECK_NONE;
+    g.update_check_result = 0;
+    g.update_check_self_matched = false;
+    bool has_update = false;
+    for (s32 i = 0; i < g.choice_count; ++i)
+        if (g.choices[i].kind == CONTENT_GAME && g.choices[i].update_index >= 0)
+            has_update = true;
+    if (!has_update || g.count <= 0) return;
+
+    /* The probe goes through the export routes, which keep their findings
+       in these flags; the dump sets them again itself. */
+    const bool romfs_base_only = g.romfs_base_only;
+    const bool exefs_base_only = g.exefs_base_only;
+    const bool romfs_self_matched = g.romfs_self_matched;
+    const u64 application_id =
+        g.applications[g.selected].record.application_id;
+
+    /* Every program the export dumps (both versions of a Switch 2
+       Edition); the worst outcome is the one the user has to know. */
+    u8 programs[8] = {0};
+    char folders[8][GAME_FOLDER_SIZE] = {{0}};
+    const s32 count = game_program_folders(programs, folders, 8);
+    UpdateCheck worst = UPDATE_CHECK_INCLUDED;
+    Result worst_result = 0;
+    for (s32 i = 0; i < count; ++i) {
+        if (count > 1) set_program_index_override(programs[i]);
+        Result result = 0;
+        const UpdateCheck check = probe_program_update(application_id,
+                                                       &result);
+        if (count > 1) set_program_index_override(-1);
+        if (g.romfs_self_matched) g.update_check_self_matched = true;
+        log_line("update-check title=%016llX program=%u status=%d result=0x%08x self-match=%u",
+                 (unsigned long long)application_id, programs[i], check,
+                 result, g.romfs_self_matched);
+        if (check > worst) {
+            worst = check;
+            worst_result = result;
+        }
+    }
+    g.update_check = worst;
+    g.update_check_result = worst_result;
+
+    g.romfs_base_only = romfs_base_only;
+    g.exefs_base_only = exefs_base_only;
+    g.romfs_self_matched = romfs_self_matched;
+}
+
 Result export_combined_game(u64 application_id, const char *root,
                             PadState *pad) {
     char package[512];
     u8 programs[8] = {0};
-    s32 program_count = game_program_indices(programs, 8);
+    char folders[8][GAME_FOLDER_SIZE] = {{0}};
+    s32 program_count = game_program_folders(programs, folders, 8);
     if (program_count <= 1) {
         snprintf(package, sizeof(package), "%s/game", root);
         return export_combined_program(application_id, package, pad);
     }
 
-    /* Switch 2 Editions: the original game (program 0) goes in game/,
-       every other program in game/program<N>/. */
+    /* One folder per program: game_switch1/ + game_switch2/ for Switch 2
+       Editions (see game_program_folders). */
     Result result = 0;
     for (s32 i = 0; i < program_count && R_SUCCEEDED(result); ++i) {
-        if (programs[i])
-            snprintf(package, sizeof(package), "%s/game/program%u", root,
-                     programs[i]);
-        else
-            snprintf(package, sizeof(package), "%s/game", root);
+        snprintf(package, sizeof(package), "%s/%s", root, folders[i]);
         set_program_index_override(programs[i]);
         result = export_combined_program(application_id, package, pad);
         set_program_index_override(-1);
