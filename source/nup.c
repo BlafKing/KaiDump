@@ -1107,7 +1107,9 @@ static Result build_prefix(Plan *plan, uint8_t **out_prefix) {
             .name_offset = source->name_offset,
             .name_length = (uint32_t)length,
             .size = source->size,
-            .extent_offset = source->extent_offset,
+            /* SPEC §3.6: zero-length files have no extent. The plan keeps
+               their position so find_file can binary-search by offset. */
+            .extent_offset = source->size ? source->extent_offset : 0,
             .extent_size = source->extent_size,
             .codec = 0,
         };
